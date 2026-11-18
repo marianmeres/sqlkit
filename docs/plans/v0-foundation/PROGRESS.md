@@ -53,7 +53,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
 | ✅ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
 | ✅ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
-| ⬜ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
+| ✅ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
 | ⬜ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | — |
 | ⬜ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | — |
 | 🔒 | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 | — |
@@ -300,6 +300,30 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      strings, templates and regular expressions blanked; one bare word in a string kept,
      as `"code"` is how a read by name is spelled) and flags a property read, a read by
      name and destructuring, in a `catch` clause or a `.catch(…)` call.
+
+- **D31** (2026-11-18, T09 session) — Found while writing the statement builders; open to
+  veto at T12 ([03](./03-conventions.md) #1).
+  1. Rule 1 holds in a match too: an `undefined` key is left out of `whereEq` and of an
+     `update`/`deleteFrom` match, which widens it (`deleteFrom("t", { tenant, id })` with
+     `id` undefined deletes the tenant's rows). Kept as written, since a filter built from
+     optional inputs wants it; the module comment says so. A match left with nothing is
+     still a `TypeError` (rule 2).
+  2. "Empty" in rules 4 and 6, and for a fragment given as the table, is a fragment with no
+     value and no text but whitespace, not `EMPTY` by identity: `raw("")`, `raw(" ")` and
+     `and()` count.
+  3. `upsert` takes one row (an array is a `TypeError`) and a non-empty `conflict` list:
+     Postgres needs a target for `do update`, and the shared subset keeps it for
+     `do nothing` too. An `update` column need not be one the row writes (its
+     `excluded` value is then the column's default, a real `updated_at` idiom). A default
+     `update` with no column left renders `do nothing`, as `update: []` does.
+  4. `returning` is `"*"` or a non-empty array of names; `[]` and any other string are a
+     `TypeError`. An options argument that is not an object is one too.
+  5. `inList` binds an `undefined` element as any value (`NULL` by the parameter rule):
+     rule 1 is about keys. A fragment element is spliced.
+  6. The root entry point exports the types `TableRef`, `Returning` and `Match` beside
+     the builders, since they appear in the builders' signatures.
+  7. The `builders` body also runs the fragments through the sync tier on an adapter that
+     has one, since the module comment promises both tiers.
 
 ## How to resume (for a fresh conversation)
 

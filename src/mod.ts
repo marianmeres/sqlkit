@@ -3,6 +3,19 @@
  * nothing from a driver library, so it loads in a Worker as well as in Node.
  */
 
+export {
+	and,
+	deleteFrom,
+	inList,
+	insert,
+	type Match,
+	or,
+	type Returning,
+	type TableRef,
+	update,
+	upsert,
+	whereEq,
+} from "./core/build.ts";
 export { classifyPg } from "./core/classify-pg.ts";
 export { classifySqlite } from "./core/classify-sqlite.ts";
 export {
