@@ -63,7 +63,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
 | ✅ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
 | ✅ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
-| ⬜ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
+| ✅ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
 | ⬜ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
 | ⬜ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 D34 | — |
 | ⬜ | T20 | T19 | Archive this plan set; copy the backlog to `docs/backlog.md` | [04](./04-scaffold-docs-release.md) #4 | D22 | — |
