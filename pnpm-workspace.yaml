@@ -1,0 +1,5 @@
+# Dependencies allowed to run their install script, and no others. esbuild and workerd each
+# fetch their platform's binary in one; the Durable Objects tests (test/do/) need both.
+allowBuilds:
+  esbuild: true
+  workerd: true
