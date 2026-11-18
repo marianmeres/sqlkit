@@ -11,6 +11,9 @@
  * one backend cannot be sent `BEGIN` at all: a Durable Object refuses every transaction
  * statement and offers a callback API instead.
  *
+ * A backend over an engine that is synchronous underneath also gives a `SyncBackend`, the
+ * same connection answering at once, and the core builds `driver.sync` over it.
+ *
  * Imports only the core's types.
  */
 
@@ -68,4 +71,27 @@ export interface SingleConnectionBackend extends Connection {
 	classify(error: unknown): SqlErrorInfo;
 	/** End the connection the adapter was given. The core calls it once. */
 	close(): MaybePromise<void>;
+}
+
+/**
+ * The same connection as a {@link SingleConnectionBackend}, synchronously: what the core
+ * builds `driver.sync` over. A statement it runs while the backend's transaction is open
+ * is part of that transaction, since it is the one connection; the core decides when
+ * that may happen (rules S1–S6, `driver.ts`).
+ */
+export interface SyncBackend {
+	/** Run one statement, as {@link Connection.run} does, and answer at once. */
+	run(text: string, params: readonly unknown[]): QueryResult<Row>;
+	/** Run a script: any number of statements, no parameters, no result. */
+	exec(script: string): void;
+	/**
+	 * Run `fn` in one transaction: commit when it returns, roll back when it throws, and
+	 * answer what `fn` answered, or throw what it threw. A failed commit rolls back and
+	 * throws.
+	 *
+	 * The core calls it only when no transaction is open on the connection, and checks
+	 * what `fn` answers before it returns: a thenable is a throw, so the backend rolls
+	 * back.
+	 */
+	transaction<T>(fn: () => T, readOnly: boolean): T;
 }

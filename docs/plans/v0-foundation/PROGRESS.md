@@ -50,7 +50,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T03 | T02 | Contract types, the parameter rule, `SqlError` classes, the pg and sqlite classifiers | [01](./01-core.md) #2, #3 | D07 D10 D11 D14 D17 | — |
 | ✅ | T04 | T03 | Durable Objects spike: workerd harness under `node:test`, assumptions A1–A6, probes P1–P8, `DO-FINDINGS.md` | [02](./02-adapters.md) #1 | D03 D05 D20 D24 | — |
 | ✅ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
-| ⬜ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
+| ✅ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
 | ⬜ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
 | ⬜ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
 | ⬜ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
@@ -223,6 +223,23 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      decided by `db.location()` (null for a database that is not a file), not by a path
      pattern. `close()` inside a transaction is a `TypeError`, since it would queue behind
      the transaction that awaits it.
+- **D28** (2026-11-18, T06 session) — Found while building the sync tier; open to veto at
+  T12 ([02](./02-adapters.md) #3).
+  1. S5 covers every async entry point, `exclusive` and `close` as well as `query`, `exec`
+     and `transaction`: from a sync callback each could only run after it returned.
+  2. S4's "open" lasts until the backend has committed or rolled back, not only until
+     the async callback settled: in between, the connection is still inside the
+     transaction. Pinned on a stub backend in `test/unit/single-backend.test.ts`.
+  3. "Inside a sync transaction" is a counter, not an `AsyncLocalStorage` mark as 02 #3's
+     note suggested: the callback is synchronous, so whatever runs while the counter is
+     up runs within it, a function bound to another context included.
+  4. S1: when the callback answered a native `Promise`, its rejection is marked handled,
+     so the `TypeError` is the one failure reported. A thenable that is not a `Promise`
+     is left untouched: calling its `then` may start work.
+  5. A sync call's own database error is thrown as the engine raised it; T08's wrapping
+     at the boundary applies to the sync tier too.
+  6. `AdapterCase.sync` is required: T07 and later rows state it, and the `sync` body
+     holds an adapter marked `false` to having no tier.
 
 ## How to resume (for a fresh conversation)
 

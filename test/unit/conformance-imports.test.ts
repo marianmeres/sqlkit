@@ -67,6 +67,8 @@ describe("unit/conformance-imports", () => {
 			"test/conformance/_adapters.ts",
 			"test/conformance/driver.ts",
 			"test/conformance/driver.test.ts",
+			"test/conformance/sync.ts",
+			"test/conformance/sync.test.ts",
 		]) {
 			assert.ok(files.includes(expected), `${expected} not in ${files.join(", ")}`);
 		}

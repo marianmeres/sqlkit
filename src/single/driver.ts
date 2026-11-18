@@ -33,6 +33,30 @@
  * statement reject, as on any other adapter, even when the engine underneath is
  * synchronous.
  *
+ * **The sync tier.** Given a `SyncBackend` too, the driver has `sync`: the same connection,
+ * answering at once, with a transaction whose callback is synchronous. The two tiers share
+ * the connection, so each refuses what would land in the wrong transaction (D16):
+ *
+ * - **S1** A `sync.transaction` callback that returns a thenable is a `TypeError`, and its
+ *   transaction is rolled back: an async callback returns at its first `await`, before
+ *   the rest of it has run.
+ * - **S2** A nested `sync.transaction` joins the open one, as it was opened.
+ * - **S3** A sync call from inside an open async transaction's own context runs inside
+ *   that transaction; a `sync.transaction` there joins it.
+ * - **S4** A sync call while an async transaction is open, from any other context, is a
+ *   `TypeError`: it could only run inside a transaction it does not belong to. "Open"
+ *   lasts until the backend has committed or rolled back, so a promise that outlived the
+ *   callback is refused too.
+ * - **S5** An async call (`query`, `exec`, `transaction`, `exclusive`, `close`) from inside
+ *   a sync transaction's callback rejects with a `TypeError`: it could only run after
+ *   the callback returned, outside the transaction.
+ * - **S6** A sync call while async statements are queued, but no transaction is open,
+ *   runs at once, ahead of them.
+ *
+ * A sync transaction's callback runs to its end before anything else can, so "inside" one
+ * is a counter, not a context: whatever runs while the counter is up runs within the
+ * callback.
+ *
  * Imports `node:async_hooks` and the core, nothing else.
  */
 
@@ -44,12 +68,13 @@ import {
 	type QueryResult,
 	type Row,
 	readOnlyOf,
+	type SyncDriver,
 	statementOf,
 	type TransactionOptions,
 } from "../core/contract.ts";
 import { normalizeParams } from "../core/params.ts";
 import type { Sql } from "../core/sql.ts";
-import type { Connection, SingleConnectionBackend } from "./backend.ts";
+import type { Connection, SingleConnectionBackend, SyncBackend } from "./backend.ts";
 
 /**
  * The transaction a context belongs to. One object per transaction, shared by every
@@ -73,18 +98,38 @@ interface Holding {
 
 const settled = (): undefined => undefined;
 
-/** A `Driver` over one connection. `close()` ends the connection the backend was given. */
-export function createSingleConnectionDriver(backend: SingleConnectionBackend): Driver {
+/**
+ * A `Driver` over one connection. `close()` ends the connection the backend was given.
+ * With `syncBackend`, the same connection answering at once, the driver has `sync` too.
+ */
+export function createSingleConnectionDriver(
+	backend: SingleConnectionBackend,
+	syncBackend?: SyncBackend,
+): Driver {
 	const dialect = backend.dialect;
 	const lock = backend.lock?.bind(backend);
 	const capabilities: Capabilities = Object.freeze({
-		sync: false,
+		sync: syncBackend !== undefined,
 		concurrentWriters: false,
 		crossProcessLock: lock !== undefined,
 	});
 
 	const current = new AsyncLocalStorage<OpenTransaction>();
 	let queue: Promise<unknown> = Promise.resolve();
+	/** An async transaction is open on the connection: from its start until it settled. */
+	let asyncOpen = false;
+	/** How many sync transaction callbacks are running: above 0, the caller is in one. */
+	let syncDepth = 0;
+
+	/** S5: an async call from inside a sync transaction's callback, refused. */
+	const insideSync = (call: string): TypeError | undefined =>
+		syncDepth > 0
+			? new TypeError(
+					`${call} cannot be called inside a sync transaction: it could only run ` +
+						"after the callback returned, outside the transaction. Use the sync " +
+						"tier there (tx.query, tx.exec, tx.transaction)",
+				)
+			: undefined;
 
 	/** Only the open transaction's own context; one whose transaction ended is none. */
 	const openTransaction = (): OpenTransaction | undefined => {
@@ -118,6 +163,15 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 		await connection.exec(script);
 	};
 
+	/** The text and the bound values of one statement; a `TypeError` when refused. */
+	const prepare = (
+		statement: Sql | string,
+		params: readonly unknown[] | undefined,
+	): { text: string; values: unknown[] } => {
+		const rendered = statementOf(statement, params, dialect);
+		return { text: rendered.text, values: normalizeParams(rendered.params, dialect) };
+	};
+
 	const query = <T = Row>(
 		statement: Sql | string,
 		params?: readonly unknown[],
@@ -125,12 +179,12 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 		let text: string;
 		let values: unknown[];
 		try {
-			const rendered = statementOf(statement, params, dialect);
-			text = rendered.text;
-			values = normalizeParams(rendered.params, dialect);
+			({ text, values } = prepare(statement, params));
 		} catch (error) {
 			return Promise.reject(error);
 		}
+		const refused = insideSync("query()");
+		if (refused !== undefined) return Promise.reject(refused);
 		const tx = openTransaction();
 		const answer =
 			tx === undefined
@@ -145,6 +199,8 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 				new TypeError(`exec(script) takes SQL text, got ${describe(script)}`),
 			);
 		}
+		const refused = insideSync("exec()");
+		if (refused !== undefined) return Promise.reject(refused);
 		const tx = openTransaction();
 		return tx === undefined
 			? enqueue(() => execOn(backend, script))
@@ -162,20 +218,29 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 		} catch (error) {
 			return Promise.reject(error);
 		}
+		const refused = insideSync("transaction()");
+		if (refused !== undefined) return Promise.reject(refused);
 		// Nested: the open transaction is the transaction, as it was opened.
 		if (openTransaction() !== undefined) return invoke(fn);
-		return enqueue(() =>
-			backend.transaction(async (connection) => {
-				const tx: OpenTransaction = { open: true, connection };
-				try {
-					return await current.run(tx, () => invoke(fn));
-				} finally {
-					// Before the backend commits or rolls back: whatever the callback left
-					// running is a stranger from here on, and queues like one.
-					tx.open = false;
-				}
-			}, readOnly),
-		);
+		return enqueue(async () => {
+			// Open for the sync tier until the backend is done, not until `fn` is: between
+			// the two the connection is still inside the transaction (S4).
+			asyncOpen = true;
+			try {
+				return await backend.transaction(async (connection) => {
+					const tx: OpenTransaction = { open: true, connection };
+					try {
+						return await current.run(tx, () => invoke(fn));
+					} finally {
+						// Before the backend commits or rolls back: whatever the callback
+						// left running is a stranger from here on, and queues like one.
+						tx.open = false;
+					}
+				}, readOnly);
+			} finally {
+				asyncOpen = false;
+			}
+		});
 	};
 
 	const holding = new AsyncLocalStorage<Holding>();
@@ -229,6 +294,8 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 		} catch (error) {
 			return Promise.reject(error);
 		}
+		const refused = insideSync("exclusive()");
+		if (refused !== undefined) return Promise.reject(refused);
 		// Re-entrant.
 		if (holds(name)) return invoke(fn);
 		// Inside an open transaction the transaction is the lock, on this connection.
@@ -264,6 +331,8 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 	let closing: Promise<void> | undefined;
 	const close = (): Promise<void> => {
 		if (closing !== undefined) return closing;
+		const refused = insideSync("close()");
+		if (refused !== undefined) return Promise.reject(refused);
 		if (openTransaction() !== undefined) {
 			// It would queue behind the transaction, which waits for it.
 			return Promise.reject(
@@ -276,6 +345,82 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 		return closing;
 	};
 
+	/**
+	 * Whether a sync call may run now, on the connection as it is. Inside a sync
+	 * transaction it is that transaction (S2); inside an open async transaction's own
+	 * context it joins that one (S3); with no transaction open it runs at once, ahead of
+	 * whatever is queued (S6). Anywhere else an async transaction is open, and the call
+	 * is refused (S4).
+	 */
+	const assertSyncTurn = (call: string): void => {
+		if (syncDepth > 0 || !asyncOpen || openTransaction() !== undefined) return;
+		throw new TypeError(
+			`sync.${call} cannot run while an async transaction is open, from outside its ` +
+				"callback: it could only run inside a transaction it does not belong to. " +
+				"Await the transaction first, or issue the call from inside its callback",
+		);
+	};
+
+	/** The sync tier over `engine`: the same connection, answering at once. */
+	const syncTier = (engine: SyncBackend): SyncDriver => {
+		/** A sync transaction's callback, counted while it runs; a thenable it answers is S1. */
+		const run = <T>(fn: (tx: SyncDriver) => T): T => {
+			syncDepth++;
+			let result: T;
+			try {
+				result = fn(tier);
+			} finally {
+				syncDepth--;
+			}
+			if (isThenable(result)) {
+				// Its outcome went with the rolled-back transaction; the TypeError says why.
+				if (result instanceof Promise)
+					Promise.prototype.then.call(result, settled, settled);
+				throw new TypeError(
+					"sync.transaction(fn): fn returned a promise, so the transaction was " +
+						"rolled back. A sync transaction's callback cannot be async: it returns " +
+						"at its first await. Use transaction() for one that awaits",
+				);
+			}
+			return result;
+		};
+
+		const tier: SyncDriver = {
+			dialect,
+			adapter: backend.adapter,
+			capabilities,
+			query<T = Row>(
+				statement: Sql | string,
+				params?: readonly unknown[],
+			): QueryResult<T> {
+				const { text, values } = prepare(statement, params);
+				assertSyncTurn("query()");
+				return engine.run(text, values) as QueryResult<T>;
+			},
+			exec(script: string): void {
+				if (typeof script !== "string") {
+					throw new TypeError(
+						`sync.exec(script) takes SQL text, got ${describe(script)}`,
+					);
+				}
+				assertSyncTurn("exec()");
+				engine.exec(script);
+			},
+			transaction<T>(fn: (tx: SyncDriver) => T, options?: TransactionOptions): T {
+				const readOnly = readOnlyOf(options);
+				assertCallback(fn, "sync.transaction(fn)");
+				assertSyncTurn("transaction()");
+				// Nested (S2), or inside an async transaction's own context (S3): the open
+				// transaction is the transaction, as it was opened.
+				if (syncDepth > 0 || openTransaction() !== undefined) return run(fn);
+				return engine.transaction(() => run(fn), readOnly);
+			},
+		};
+		return tier;
+	};
+
+	const sync = syncBackend === undefined ? undefined : syncTier(syncBackend);
+	// One object: the `tx` every callback receives is this driver, `sync` included.
 	const driver: Driver = {
 		dialect,
 		adapter: backend.adapter,
@@ -285,8 +430,17 @@ export function createSingleConnectionDriver(backend: SingleConnectionBackend): 
 		transaction,
 		exclusive,
 		close,
+		...(sync === undefined ? {} : { sync }),
 	};
 	return driver;
+}
+
+/** Whatever `await` would wait for: an object or function with a `then` method. */
+function isThenable(value: unknown): boolean {
+	return (
+		((typeof value === "object" && value !== null) || typeof value === "function") &&
+		typeof (value as { then?: unknown }).then === "function"
+	);
 }
 
 /** A callback, refused before anything starts when it is not a function. */

@@ -1,6 +1,7 @@
-// The node:sqlite adapter's own behaviour (plan doc 02 #2): what `openSqlite` sets on the
-// database it opens, what `createSqliteDriver` leaves alone on one the host opened (D23),
-// `close()` (D13), and a read-only transaction beside another handle's write.
+// The node:sqlite adapter's own behaviour (plan doc 02 #2, #3): what `openSqlite` sets on
+// the database it opens, what `createSqliteDriver` leaves alone on one the host opened
+// (D23), `close()` (D13), its sync tier being the host's handle, and a read-only
+// transaction, on either tier, beside another handle's write.
 //
 // Adapter-specific, not a conformance body: each case is about the handle node:sqlite
 // gives (its pragmas, its open options, a second handle on the same file), which no other
@@ -106,16 +107,17 @@ describe("sqlite/adapter: openSqlite", () => {
 		});
 	});
 
-	test("answers a node:sqlite driver: one connection, no sync tier yet, no cross-process lock", async () => {
+	test("answers a node:sqlite driver: one connection, a sync tier, no cross-process lock", async () => {
 		const db = openSqlite();
 		try {
 			assert.equal(db.dialect, "sqlite");
 			assert.equal(db.adapter, "node:sqlite");
 			assert.deepEqual(db.capabilities, {
-				sync: false,
+				sync: true,
 				concurrentWriters: false,
 				crossProcessLock: false,
 			});
+			assert.ok(db.sync !== undefined);
 		} finally {
 			await db.close();
 		}
@@ -123,6 +125,21 @@ describe("sqlite/adapter: openSqlite", () => {
 });
 
 describe("sqlite/adapter: createSqliteDriver", () => {
+	test("the driver has a sync tier over the host's handle", async () => {
+		const handle = new DatabaseSync(":memory:");
+		const db = createSqliteDriver(handle);
+		try {
+			assert.equal(db.capabilities.sync, true);
+			assert.ok(db.sync !== undefined);
+			db.sync.exec("create table t (id text primary key)");
+			assert.equal(db.sync.query("insert into t (id) values ('a')").rowCount, 1);
+			// The same handle, not a second connection to the database.
+			assert.equal(handle.prepare("select id from t").get()?.id, "a");
+		} finally {
+			await db.close();
+		}
+	});
+
 	test("sets nothing on a handle the host opened", async () => {
 		await inTempDir(async (dir) => {
 			const handle = new DatabaseSync(join(dir, "host.db"));
@@ -258,6 +275,39 @@ describe("sqlite/adapter: read-only transactions", () => {
 					[0, 0],
 					"the reader saw a later commit",
 				);
+				assert.equal(await count(reader), 1);
+			} finally {
+				await reader.close();
+				await writer.close();
+			}
+		});
+	});
+
+	test("a read-only sync transaction takes no write lock either", async () => {
+		await inTempDir(async (dir) => {
+			const path = join(dir, "read-only-sync.db");
+			const reader = openSqlite(path);
+			const writer = openSqlite(path, { busyTimeout: 150 });
+			try {
+				const sync = reader.sync;
+				assert.ok(sync !== undefined);
+				sync.exec("create table t (id text primary key)");
+				const seen = sync.transaction(
+					(tx) => {
+						const first = Number(
+							tx.query("select count(*) as n from t").rows[0]?.n,
+						);
+						// Another handle, synchronously: it would fail after 150 ms if the
+						// reader held the write lock.
+						writer.sync?.query("insert into t (id) values ('w')");
+						return [
+							first,
+							Number(tx.query("select count(*) as n from t").rows[0]?.n),
+						];
+					},
+					{ readOnly: true },
+				);
+				assert.deepEqual(seen, [0, 0], "the reader saw a later commit");
 				assert.equal(await count(reader), 1);
 			} finally {
 				await reader.close();

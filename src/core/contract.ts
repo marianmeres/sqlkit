@@ -152,6 +152,20 @@ export interface Driver {
  * A database, synchronously: `Driver`'s sibling on an engine that is synchronous
  * underneath. Its transaction callback is synchronous too, which is the point of it: an
  * async one would return at its first `await` and leave the transaction open.
+ *
+ * A refused call throws its `TypeError` at the call. The sync tier is the same connection
+ * as the async one, so the two refuse each other where a call would land in the wrong
+ * transaction:
+ *
+ * - **S1** A transaction callback that returns a thenable rolls back, with a `TypeError`.
+ * - **S2** A nested `transaction` joins the open one, as it was opened.
+ * - **S3** A sync call from inside an open async transaction's own callback runs inside
+ *   that transaction.
+ * - **S4** A sync call while an async transaction is open, from anywhere else, is a
+ *   `TypeError`.
+ * - **S5** An async call from inside a sync transaction's callback rejects with a
+ *   `TypeError`: it could only run after the callback returned.
+ * - **S6** With no transaction open, a sync call runs at once, ahead of queued async work.
  */
 export interface SyncDriver {
 	readonly dialect: DialectName;

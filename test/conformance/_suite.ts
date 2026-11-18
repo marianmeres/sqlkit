@@ -23,6 +23,12 @@ export interface Fixture {
 export interface AdapterCase {
 	/** `"sqlite"`, later `"pg"`, `"pg-client"`, `"pglite"`, `"do"`. */
 	readonly name: string;
+	/**
+	 * Whether its driver has a sync tier (`driver.sync`). Stated, not read from the
+	 * driver, so that the `sync` body can hold the driver to it: a tier that went missing
+	 * fails, it does not shorten the suite.
+	 */
+	readonly sync: boolean;
 	/** A database isolated from every other case: each case creates and disposes one. */
 	create(): Promise<Fixture>;
 }

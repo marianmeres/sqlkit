@@ -4,10 +4,18 @@
 // transaction object, and one with a lock, arrive with later adapters. The routing and the
 // lock calls are the core's, so they are pinned here, on a backend that records what it
 // was asked. No database.
+//
+// The sync tier's routing is pinned here too (plan doc 02 #3), along with the one moment
+// of S4 no adapter can be timed into: after the async callback settled, before the
+// backend committed.
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { Connection, SingleConnectionBackend } from "../../src/single/backend.ts";
+import type {
+	Connection,
+	SingleConnectionBackend,
+	SyncBackend,
+} from "../../src/single/backend.ts";
 import { createSingleConnectionDriver } from "../../src/single/driver.ts";
 
 /** A gate a case opens by hand. */
@@ -236,5 +244,117 @@ describe("unit/single-backend: exclusive over a backend lock", () => {
 			/unlock failed/,
 		);
 		assert.ok(ran, "the name stayed taken after a failed release");
+	});
+});
+
+/** A sync backend that logs into `log`, as the stub's own connection would. */
+function syncStub(log: string[]): SyncBackend {
+	return {
+		run(text, params) {
+			log.push(
+				`sync: ${text}${params.length > 0 ? ` ${JSON.stringify(params)}` : ""}`,
+			);
+			return { rows: [], rowCount: 0 };
+		},
+		exec(script) {
+			log.push(`sync exec: ${script}`);
+		},
+		transaction(fn, readOnly) {
+			log.push(readOnly ? "sync begin read only" : "sync begin");
+			try {
+				const result = fn();
+				log.push("sync commit");
+				return result;
+			} catch (error) {
+				log.push("sync rollback");
+				throw error;
+			}
+		},
+	};
+}
+
+describe("unit/single-backend: the sync tier", () => {
+	test("a sync backend makes the tier: capabilities.sync, and sync on the driver itself", async () => {
+		const { backend, log } = stub();
+		const db = createSingleConnectionDriver(backend, syncStub(log));
+		assert.equal(db.capabilities.sync, true);
+		assert.ok(db.sync !== undefined);
+		assert.equal(db.sync.capabilities, db.capabilities);
+		await db.transaction(async (tx) => {
+			assert.equal(
+				tx,
+				db,
+				"the callback was handed a driver without its sync tier",
+			);
+			assert.equal(tx.sync, db.sync);
+		});
+		const without = createSingleConnectionDriver(stub().backend);
+		assert.equal("sync" in without, false);
+	});
+
+	test("the backend is asked for a sync transaction only at the top level", async () => {
+		const { backend, log } = stub();
+		const db = createSingleConnectionDriver(backend, syncStub(log));
+		const sync = db.sync;
+		assert.ok(sync !== undefined);
+		sync.transaction(
+			(tx) => {
+				tx.query("select ?", [true]);
+				tx.transaction((nested) => nested.exec("nested"));
+			},
+			{ readOnly: true },
+		);
+		// Inside an async transaction's own context: its connection, no transaction of
+		// the sync backend's.
+		await db.transaction(async () => {
+			sync.query("joined");
+			sync.transaction((tx) => tx.query("joined transaction"));
+		});
+		assert.deepEqual(log, [
+			"sync begin read only",
+			"sync: select ? [true]",
+			"sync exec: nested",
+			"sync commit",
+			"begin",
+			"sync: joined",
+			"sync: joined transaction",
+			"commit",
+		]);
+	});
+
+	test("S4 holds until the backend has committed, not only until the callback settled", async () => {
+		const { backend, log } = stub();
+		const settled = gate();
+		const committing = gate();
+		// A backend that, like a real one, still has work to do after the callback.
+		backend.transaction = async (fn) => {
+			log.push("begin");
+			const result = await fn(backend);
+			settled.open();
+			await committing.opened;
+			log.push("commit");
+			return result;
+		};
+		const db = createSingleConnectionDriver(backend, syncStub(log));
+		const sync = db.sync;
+		assert.ok(sync !== undefined);
+		let straggler: Promise<unknown> | undefined;
+		const open = db.transaction(async () => {
+			// Started inside, run after the callback settled: a stranger by then (R6).
+			straggler = (async () => {
+				await settled.opened;
+				return sync.query("straggler");
+			})();
+		});
+		await settled.opened;
+		try {
+			assert.throws(() => sync.query("stranger"), TypeError);
+			await assert.rejects(straggler ?? Promise.resolve(), TypeError);
+		} finally {
+			committing.open();
+		}
+		await open;
+		sync.query("after");
+		assert.deepEqual(log, ["begin", "commit", "sync: after"]);
 	});
 });

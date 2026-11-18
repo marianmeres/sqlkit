@@ -7,6 +7,9 @@
  * only when that transaction's own callback issued it. A transaction is `BEGIN IMMEDIATE`;
  * a read-only one is a deferred `BEGIN` with `PRAGMA query_only` on for its length.
  *
+ * The handle is synchronous, so the driver has a sync tier too: `driver.sync`, the same
+ * handle answering at once, with a transaction whose callback is synchronous.
+ *
  * Two entry points:
  *
  * - `createSqliteDriver(db)` takes a database the host opened and sets nothing on it: its
@@ -19,7 +22,11 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import { classifySqlite } from "../core/classify-sqlite.ts";
 import type { Driver, QueryResult, Row } from "../core/contract.ts";
-import type { Connection, SingleConnectionBackend } from "../single/backend.ts";
+import type {
+	Connection,
+	SingleConnectionBackend,
+	SyncBackend,
+} from "../single/backend.ts";
 import { createSingleConnectionDriver } from "../single/driver.ts";
 
 /** How long `openSqlite` makes a statement wait for another connection's lock, by default. */
@@ -38,7 +45,7 @@ export interface OpenSqliteOptions {
 /**
  * A driver over a database the host opened. Nothing is set on the handle: no busy
  * timeout, no journal mode, no pragma. `close()` closes it; a host that keeps its
- * database does not call it.
+ * database does not call it. `driver.sync` is the same handle, synchronously.
  */
 export function createSqliteDriver(db: DatabaseSync): Driver {
 	if (
@@ -49,7 +56,8 @@ export function createSqliteDriver(db: DatabaseSync): Driver {
 	) {
 		throw new TypeError("createSqliteDriver(db) takes a node:sqlite DatabaseSync");
 	}
-	return createSingleConnectionDriver(sqliteBackend(db));
+	const { backend, sync } = sqliteBackends(db);
+	return createSingleConnectionDriver(backend, sync);
 }
 
 /**
@@ -96,8 +104,60 @@ function plainRow(row: Record<string, unknown>): Row {
 	return { ...row };
 }
 
-/** One node:sqlite handle as a single-connection backend. */
-function sqliteBackend(db: DatabaseSync): SingleConnectionBackend {
+/** One node:sqlite handle as a single-connection backend, and as its sync tier's. */
+function sqliteBackends(db: DatabaseSync): {
+	backend: SingleConnectionBackend;
+	sync: SyncBackend;
+} {
+	const run = (text: string, params: readonly unknown[]): QueryResult<Row> => {
+		const statement = prepare(db, text);
+		// The core bound every value by the parameter rule: each is one SQLite takes.
+		const values = params as SQLInputValue[];
+		// Rows or a count by what the statement returns, not by a keyword: a write with
+		// `RETURNING` has columns, a plain one has none.
+		if (statement.columns().length > 0) {
+			const rows = statement.all(...values).map(plainRow);
+			return { rows, rowCount: rows.length };
+		}
+		const { changes } = statement.run(...values);
+		return { rows: [], rowCount: Number(changes) };
+	};
+
+	const exec = (script: string): void => {
+		db.exec(script);
+	};
+
+	/**
+	 * Open a transaction, and answer whether `query_only` was turned on for it. That is
+	 * the connection's setting, on for exactly this transaction's length: nothing else
+	 * uses the connection meanwhile. A handle the host made query-only stays so.
+	 */
+	const begin = (readOnly: boolean): boolean => {
+		// `Number`: a handle opened with `readBigInts` reads the pragma as `0n`.
+		const restrict =
+			readOnly && Number(prepare(db, "PRAGMA query_only").get()?.query_only) === 0;
+		if (restrict) db.exec("PRAGMA query_only = ON");
+		try {
+			// A read-only one takes no write lock: another connection to the file keeps
+			// writing, and its snapshot starts at its first statement.
+			db.exec(readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
+		} catch (error) {
+			if (restrict) db.exec("PRAGMA query_only = OFF");
+			throw error;
+		}
+		return restrict;
+	};
+
+	/** Commit, or roll back and throw when the commit failed. */
+	const commit = (): void => {
+		try {
+			db.exec("COMMIT");
+		} catch (error) {
+			rollback();
+			throw error;
+		}
+	};
+
 	/** Undo the open transaction, keeping whatever failure led here. */
 	const rollback = (): void => {
 		if (!db.isTransaction) return;
@@ -108,55 +168,34 @@ function sqliteBackend(db: DatabaseSync): SingleConnectionBackend {
 		}
 	};
 
+	/** Close a transaction `begin` opened: `query_only` off again if it turned it on. */
+	const end = (restrict: boolean): void => {
+		if (restrict) db.exec("PRAGMA query_only = OFF");
+	};
+
 	const backend: SingleConnectionBackend = {
 		dialect: "sqlite",
 		adapter: "node:sqlite",
-
-		run(text: string, params: readonly unknown[]): QueryResult<Row> {
-			const statement = prepare(db, text);
-			// The core bound every value by the parameter rule: each is one SQLite takes.
-			const values = params as SQLInputValue[];
-			// Rows or a count by what the statement returns, not by a keyword: a write
-			// with `RETURNING` has columns, a plain one has none.
-			if (statement.columns().length > 0) {
-				const rows = statement.all(...values).map(plainRow);
-				return { rows, rowCount: rows.length };
-			}
-			const { changes } = statement.run(...values);
-			return { rows: [], rowCount: Number(changes) };
-		},
-
-		exec(script: string): void {
-			db.exec(script);
-		},
+		run,
+		exec,
 
 		async transaction<T>(
 			fn: (inner: Connection) => Promise<T>,
 			readOnly: boolean,
 		): Promise<T> {
-			// `query_only` is the connection's setting, on for exactly this transaction's
-			// length: nothing else uses the connection meanwhile. A handle the host made
-			// query-only stays so.
-			// `Number`: a handle opened with `readBigInts` reads the pragma as `0n`.
-			const restrict =
-				readOnly &&
-				Number(prepare(db, "PRAGMA query_only").get()?.query_only) === 0;
-			if (restrict) db.exec("PRAGMA query_only = ON");
+			const restrict = begin(readOnly);
 			try {
-				// A read-only one takes no write lock: another connection to the file keeps
-				// writing, and its snapshot starts at its first statement.
-				db.exec(readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
 				let result: T;
 				try {
 					result = await fn(backend);
-					db.exec("COMMIT");
 				} catch (error) {
 					rollback();
 					throw error;
 				}
+				commit();
 				return result;
 			} finally {
-				if (restrict) db.exec("PRAGMA query_only = OFF");
+				end(restrict);
 			}
 		},
 
@@ -166,5 +205,27 @@ function sqliteBackend(db: DatabaseSync): SingleConnectionBackend {
 			if (db.isOpen) db.close();
 		},
 	};
-	return backend;
+
+	const sync: SyncBackend = {
+		run,
+		exec,
+		transaction<T>(fn: () => T, readOnly: boolean): T {
+			const restrict = begin(readOnly);
+			try {
+				let result: T;
+				try {
+					result = fn();
+				} catch (error) {
+					rollback();
+					throw error;
+				}
+				commit();
+				return result;
+			} finally {
+				end(restrict);
+			}
+		},
+	};
+
+	return { backend, sync };
 }

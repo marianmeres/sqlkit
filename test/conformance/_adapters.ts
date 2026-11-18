@@ -11,6 +11,7 @@ export const ADAPTERS: readonly AdapterCase[] = [
 	{
 		// A fresh in-memory database per case.
 		name: "sqlite",
+		sync: true,
 		create(): Promise<Fixture> {
 			const driver = openSqlite();
 			return Promise.resolve({ driver, dispose: () => driver.close() });
