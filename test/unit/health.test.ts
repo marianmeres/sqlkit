@@ -1,10 +1,10 @@
-// `checkHealth` and `createHealthMonitor` (plan doc 03 #3), against a stub driver whose
-// `select 1` a case answers by hand: what a check reports for each way a driver can
-// refuse, when the monitor checks and when it calls `onChange`, and that `stop()` leaves
-// nothing behind. The monitor's timer is `node:test`'s mocked `setTimeout`, except in the
-// one case that shows the real timer does not keep a process alive. A live driver's check
-// is the `driver` conformance body's. Imports the root entry point, so it also proves both
-// are exported there.
+// `checkHealth` and `createHealthMonitor` (plan doc 03 #3, #6), against a stub driver
+// whose `select 1` a case answers by hand: what a check reports for each way a driver can
+// refuse or fail to answer in time, when the monitor checks and when it calls `onChange`,
+// and that `stop()` leaves nothing behind. The timers are `node:test`'s mocked
+// `setTimeout`, except in the cases that show the real ones do not keep a process alive.
+// A live driver's check is the `driver` conformance body's. Imports the root entry point,
+// so it also proves both are exported there.
 import assert from "node:assert/strict";
 import { describe, type TestContext, test } from "node:test";
 import {
@@ -86,6 +86,58 @@ function gate(): { opened: Promise<void>; open: () => void } {
 
 const lost = (): SqlError =>
 	new ConnectionError("Connection terminated", "pg", { kind: "connection" });
+
+/** A promise that never settles: a `select 1` that never answers. */
+const never = (): Promise<unknown> => new Promise(() => {});
+
+/** Mocked `setTimeout`; `tick` advances it and lets what the timers started run. */
+function mockTimers(t: TestContext): (ms: number) => Promise<void> {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	return async (ms) => {
+		t.mock.timers.tick(ms);
+		await flush();
+	};
+}
+
+/**
+ * Watches the timers the current `setTimeout` (mocked or real) is asked for with a delay
+ * of `ms`: their handles, which of them were cleared, and how many fired. `restore` puts
+ * the watched functions back.
+ */
+function watchTimers(ms: number): {
+	handles: ReturnType<typeof setTimeout>[];
+	cleared: unknown[];
+	fired: { count: number };
+	restore: () => void;
+} {
+	const set = globalThis.setTimeout;
+	const clear = globalThis.clearTimeout;
+	const handles: ReturnType<typeof setTimeout>[] = [];
+	const cleared: unknown[] = [];
+	const fired = { count: 0 };
+	globalThis.setTimeout = ((handler: () => void, delay?: number) => {
+		if (delay !== ms) return set(handler, delay);
+		const handle = set(() => {
+			fired.count += 1;
+			handler();
+		}, delay);
+		handles.push(handle);
+		return handle;
+	}) as typeof setTimeout;
+	globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+		cleared.push(handle);
+		clear(handle);
+	}) as typeof clearTimeout;
+	return {
+		handles,
+		cleared,
+		fired,
+		restore: () => {
+			globalThis.setTimeout = set;
+			globalThis.clearTimeout = clear;
+		},
+	};
+}
 
 describe("unit/health: checkHealth", () => {
 	test("a driver that answers is healthy, timed, with when it was checked", async () => {
@@ -195,14 +247,171 @@ describe("unit/health: checkHealth", () => {
 	});
 });
 
-/** Mocked `setTimeout`; `tick` advances it and lets what the timers started run. */
-function mockTimers(t: TestContext): (ms: number) => Promise<void> {
-	t.mock.timers.enable({ apis: ["setTimeout"] });
-	return async (ms) => {
-		t.mock.timers.tick(ms);
-		await flush();
-	};
-}
+describe("unit/health: the check's timeout", () => {
+	for (const dialect of ["pg", "sqlite"] as const) {
+		test(`a query that never answers is unhealthy at timeoutMs, not before (${dialect})`, async (t) => {
+			const tick = mockTimers(t);
+			const stub = stubDriver(dialect);
+			stub.answer = { pending: never() };
+			const got: HealthStatus[] = [];
+			const before = Date.now();
+			void checkHealth(stub.driver, { timeoutMs: 1_000 }).then((s) => {
+				got.push(s);
+			});
+			const after = Date.now();
+			assert.deepEqual(stub.sent, ["select 1"]);
+			await tick(999);
+			assert.equal(got.length, 0);
+			await tick(1);
+			assert.equal(got.length, 1);
+			const status = got[0];
+			assert.ok(status);
+			assert.equal(status.healthy, false);
+			assert.equal(status.latencyMs, null);
+			assert.ok(status.error instanceof ConnectionError);
+			assert.equal(status.error.dialect, dialect);
+			assert.equal(status.error.kind, "connection");
+			assert.equal(status.error.retryable, true);
+			assert.equal(status.error.code, undefined);
+			assert.equal(status.error.cause, undefined);
+			assert.equal("cause" in status.error, false);
+			assert.match(status.error.message, /timed out after 1000 ms/);
+			// `checkedAt` is when the check was sent, not when it timed out.
+			assert.ok(
+				status.checkedAt.getTime() >= before &&
+					status.checkedAt.getTime() <= after,
+			);
+			assert.deepEqual(stub.sent, ["select 1"]);
+		});
+	}
+
+	test("the default timeout is 5 s", async (t) => {
+		const tick = mockTimers(t);
+		const stub = stubDriver();
+		stub.answer = { pending: never() };
+		const got: HealthStatus[] = [];
+		void checkHealth(stub.driver).then((s) => {
+			got.push(s);
+		});
+		await tick(4_999);
+		assert.equal(got.length, 0);
+		await tick(1);
+		assert.equal(got.length, 1);
+		assert.equal(got[0]?.healthy, false);
+		assert.match(String(got[0]?.error?.message), /timed out after 5000 ms/);
+	});
+
+	test("an answer after the timeout does not change the status already given", async (t) => {
+		const tick = mockTimers(t);
+		for (const late of [{ ok: true }, { reject: lost() }] as const) {
+			const stub = stubDriver();
+			const answer = gate();
+			stub.answer = {
+				pending: answer.opened.then(() => {
+					if ("reject" in late) throw late.reject;
+				}),
+			};
+			const pending = checkHealth(stub.driver, { timeoutMs: 100 });
+			await tick(100);
+			const status = await pending;
+			const seen = { ...status };
+			answer.open(); // the abandoned select 1 answers now
+			await flush();
+			assert.deepEqual({ ...status }, seen);
+			assert.equal(status.healthy, false);
+			assert.match(String(status.error?.message), /timed out after 100 ms/);
+			// And it was abandoned, not sent again.
+			assert.equal(stub.sent.length, 1);
+		}
+	});
+
+	test("an answer before the timeout clears the timer", async (t) => {
+		const tick = mockTimers(t);
+		const timeoutMs = 4_321;
+		const answers: Answer[] = [{ ok: true }, { reject: lost() }, { throws: lost() }];
+		for (const answer of answers) {
+			const watch = watchTimers(timeoutMs);
+			try {
+				const stub = stubDriver();
+				stub.answer = answer;
+				const status = await checkHealth(stub.driver, { timeoutMs });
+				assert.equal(status.healthy, "ok" in answer);
+				assert.equal(watch.handles.length, 1);
+				assert.ok(watch.cleared.includes(watch.handles[0]));
+				await tick(timeoutMs * 2);
+				assert.equal(watch.fired.count, 0);
+			} finally {
+				watch.restore();
+			}
+		}
+	});
+
+	test("the real timer does not keep a process alive, and is cleared on the answer", async () => {
+		// Mocked timers do not track `unref`, so this case watches the real `setTimeout`.
+		const timeoutMs = 876_543;
+		const stub = stubDriver();
+		const answer = gate();
+		stub.answer = { pending: answer.opened };
+		const watch = watchTimers(timeoutMs);
+		try {
+			const pending = checkHealth(stub.driver, { timeoutMs });
+			assert.equal(watch.handles.length, 1);
+			const handle = watch.handles[0];
+			assert.equal(handle?.hasRef(), false);
+			assert.equal(watch.cleared.includes(handle), false);
+			answer.open();
+			assert.equal((await pending).healthy, true);
+			assert.ok(watch.cleared.includes(handle));
+		} finally {
+			// On a failed assertion too: the check answers, so its timer is cleared and
+			// cannot hold the run open if it was left referenced.
+			answer.open();
+			watch.restore();
+		}
+	});
+
+	test("a wrong timeoutMs or options is a TypeError, thrown at the call", async () => {
+		const { driver } = stubDriver();
+		const cases: [unknown, RegExp][] = [
+			[null, /^checkHealth\(db, options\) takes an object, got null/],
+			["fast", /takes an object, got string/],
+			[{ timeoutMs: 0 }, /timeoutMs must be .* above 0 .*, got 0/],
+			[{ timeoutMs: -1 }, /timeoutMs .* got -1/],
+			[{ timeoutMs: Number.NaN }, /timeoutMs .* got NaN/],
+			[{ timeoutMs: Number.POSITIVE_INFINITY }, /timeoutMs .* got Infinity/],
+			[{ timeoutMs: 2 ** 31 }, /timeoutMs .* at most 2147483647/],
+			[{ timeoutMs: "1000" }, /timeoutMs .* got string/],
+		];
+		for (const [options, pattern] of cases) {
+			assert.throws(
+				() => checkHealth(driver, loose(options)),
+				(error: unknown) =>
+					error instanceof TypeError &&
+					/^checkHealth/.test(error.message) &&
+					pattern.test(error.message),
+				JSON.stringify(options),
+			);
+			if (options !== null && typeof options === "object") {
+				assert.throws(
+					() => createHealthMonitor(driver, loose(options)),
+					(error: unknown) =>
+						error instanceof TypeError &&
+						/^createHealthMonitor: timeoutMs/.test(error.message) &&
+						pattern.test(error.message),
+					JSON.stringify(options),
+				);
+			}
+		}
+		// The edges are accepted (a check that answers at once clears its timer).
+		assert.equal((await checkHealth(driver, { timeoutMs: 1 })).healthy, true);
+		assert.equal(
+			(await checkHealth(driver, { timeoutMs: 2 ** 31 - 1 })).healthy,
+			true,
+		);
+		createHealthMonitor(driver, { timeoutMs: 1 });
+		createHealthMonitor(driver, { timeoutMs: 2 ** 31 - 1 });
+	});
+});
 
 /** What `onChange` was called with, as `[healthy, previous healthy]` pairs. */
 function changes(): {
@@ -307,12 +516,13 @@ describe("unit/health: createHealthMonitor", () => {
 		await tick(1);
 		assert.equal(stub.sent.length, 2);
 
-		// One check at a time: a slow one delays the next, it is not run beside it.
+		// One check at a time: a slow one (still within the 5 s timeout) delays the next,
+		// it is not run beside it.
 		const slow = gate();
 		stub.answer = { pending: slow.opened };
 		await tick(500);
 		assert.equal(stub.sent.length, 3);
-		await tick(5_000);
+		await tick(4_999);
 		assert.equal(stub.sent.length, 3);
 		stub.answer = { ok: true };
 		slow.open();
@@ -495,6 +705,102 @@ describe("unit/health: createHealthMonitor", () => {
 		// The edges are accepted.
 		createHealthMonitor(driver, { intervalMs: 1 });
 		createHealthMonitor(driver, { intervalMs: 2 ** 31 - 1 });
+	});
+
+	test("a check that hangs is reported unhealthy at the timeout; the next starts intervalMs later", async (t) => {
+		const tick = mockTimers(t);
+		const stub = stubDriver("sqlite");
+		const { seen, statuses, onChange } = changes();
+		const monitor = createHealthMonitor(stub.driver, {
+			intervalMs: 1_000,
+			timeoutMs: 300,
+			onChange,
+		});
+		await monitor.start();
+		assert.deepEqual(seen, [[true, null]]);
+
+		// The second check hangs, once.
+		const hung = gate();
+		stub.answer = { pending: hung.opened };
+		await tick(1_000);
+		assert.equal(stub.sent.length, 2);
+		stub.answer = { ok: true };
+		await tick(299);
+		assert.deepEqual(seen, [[true, null]]);
+		assert.equal(monitor.last()?.healthy, true);
+		await tick(1);
+		assert.deepEqual(seen, [
+			[true, null],
+			[false, true],
+		]);
+		const down = statuses[1]?.[0];
+		assert.ok(down?.error instanceof ConnectionError);
+		assert.equal(down.error.dialect, "sqlite");
+		assert.match(down.error.message, /timed out after 300 ms/);
+		assert.equal(monitor.last(), down);
+
+		// The next check starts `intervalMs` after the timeout, and flips back.
+		await tick(999);
+		assert.equal(stub.sent.length, 2);
+		await tick(1);
+		assert.equal(stub.sent.length, 3);
+		assert.deepEqual(seen, [
+			[true, null],
+			[false, true],
+			[true, false],
+		]);
+
+		// The abandoned check answers late: nothing is reported, nothing extra scheduled.
+		hung.open();
+		await flush();
+		assert.equal(seen.length, 3);
+		await tick(1_000);
+		assert.equal(stub.sent.length, 4);
+		monitor.stop();
+	});
+
+	test("the monitor's default timeout is 5 s", async (t) => {
+		const tick = mockTimers(t);
+		const stub = stubDriver();
+		stub.answer = { pending: never() };
+		const { seen, onChange } = changes();
+		const monitor = createHealthMonitor(stub.driver, { onChange });
+		let started = false;
+		const start = monitor.start().then(() => {
+			started = true;
+		});
+		await tick(4_999);
+		assert.equal(started, false);
+		assert.equal(monitor.last(), null);
+		await tick(1);
+		await start;
+		assert.deepEqual(seen, [[false, null]]);
+		monitor.stop();
+	});
+
+	test("a stopped run's check that never answers still ends at its timeout, unreported", async (t) => {
+		const tick = mockTimers(t);
+		const stub = stubDriver();
+		stub.answer = { pending: never() };
+		const { seen, onChange } = changes();
+		const monitor = createHealthMonitor(stub.driver, {
+			intervalMs: 100,
+			timeoutMs: 200,
+			onChange,
+		});
+		let settled = false;
+		const first = monitor.start().then(() => {
+			settled = true;
+		});
+		monitor.stop();
+		await tick(199);
+		assert.equal(settled, false);
+		await tick(1);
+		await first;
+		assert.equal(monitor.last(), null);
+		assert.deepEqual(seen, []);
+		await tick(10_000);
+		assert.equal(stub.sent.length, 1);
 	});
 
 	test("a status the monitor reports is what checkHealth returns", async (t) => {
