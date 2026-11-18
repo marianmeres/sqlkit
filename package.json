@@ -19,6 +19,10 @@
     ".": {
       "types": "./dist/mod.d.ts",
       "import": "./dist/mod.js"
+    },
+    "./sqlite": {
+      "types": "./dist/sqlite/mod.d.ts",
+      "import": "./dist/sqlite/mod.js"
     }
   },
   "files": [

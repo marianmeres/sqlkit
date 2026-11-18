@@ -49,7 +49,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T02 | T01 | `sql` fragments: `sql`, `raw`, `bind`, `join`, `ident`, `json`, `render`; the core-imports guard | [01](./01-core.md) #1 | D02 D21 | — |
 | ✅ | T03 | T02 | Contract types, the parameter rule, `SqlError` classes, the pg and sqlite classifiers | [01](./01-core.md) #2, #3 | D07 D10 D11 D14 D17 | — |
 | ✅ | T04 | T03 | Durable Objects spike: workerd harness under `node:test`, assumptions A1–A6, probes P1–P8, `DO-FINDINGS.md` | [02](./02-adapters.md) #1 | D03 D05 D20 D24 | — |
-| ⬜ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
+| ✅ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
 | ⬜ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
 | ⬜ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
 | ⬜ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
@@ -202,6 +202,27 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      since SQLite reports an unnamed check by its expression text.
   4. `SqlError`'s constructor refuses an unknown `kind` or dialect with a `TypeError`;
      each class's `name` is set on its prototype.
+- **D27** (2026-11-18, T05 session) — Found while building the single-connection core
+  and the node:sqlite adapter; open to veto at T12 ([02](./02-adapters.md) #2).
+  1. A statement that returns no columns reports SQLite's `changes`, which DDL does not
+     reset: on Node 26.13.1 a `create table` after a two-row insert reports `rowCount` 2.
+     R2 promises a count for `SELECT`, a plain write and `RETURNING` only, and the `driver`
+     body asserts nothing for DDL. F10 found the same on Durable Objects. T12 decides
+     whether a non-write's `rowCount` is promised (a `total_changes()` delta would make it
+     0, at two extra statements per write).
+  2. The core derives `capabilities.crossProcessLock` from the backend having `lock`, and
+     sets `concurrentWriters` false. Outside a transaction it calls `lock(name, false)`, and
+     the release, in the connection's turn, after the in-process queue for that name:
+     while a lock is being waited for, nothing else runs on that connection (T15's
+     `pg.Client` polls there). Inside one it calls `lock(name, true)` once per holder.
+     Pinned against a stub backend in `test/unit/single-backend.test.ts`.
+  3. `classify` is on the seam but not yet applied: wrapping errors is T08's.
+  4. node:sqlite: a read-only transaction reads `query_only` first and leaves a handle the
+     host made query-only so; rows are objects even on a handle opened with
+     `returnArrays`; `close()` does not close a handle the host already closed; WAL is
+     decided by `db.location()` (null for a database that is not a file), not by a path
+     pattern. `close()` inside a transaction is a `TypeError`, since it would queue behind
+     the transaction that awaits it.
 
 ## How to resume (for a fresh conversation)
 
