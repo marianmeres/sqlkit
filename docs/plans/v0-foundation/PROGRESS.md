@@ -55,7 +55,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
 | ✅ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
 | ✅ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | — |
-| ⬜ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | — |
+| ✅ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | — |
 | 🔒 | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 | — |
 | ⬜ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
 | ⬜ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 | — |
@@ -358,6 +358,46 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      `bigint` (`bigint` on `pg`, `integer` on `sqlite`) and a fraction (`numeric(10, 2)`,
      `real`), pins on `sqlite` that the rows read back undecoded, and decodes rows from the
      sync tier on an adapter that has one.
+
+- **D33** (2026-11-18, T11 session) — Found while writing retry and health; open to veto
+  at T12 ([03](./03-conventions.md) #3).
+  1. `fn` receives the number of the call, 1 for the first; `onRetry`'s `attempt` is the
+     call that failed, so retry `n` follows attempt `n`. `onRetry` is called before the
+     wait, as the prior implementation logged before it slept.
+  2. A hook that throws (`retryable`, `onRetry`) ends the run with what it threw,
+     untouched, as callback code always comes out here; the database error it was
+     handed is not kept. A synchronous throw from `fn` counts as its rejection.
+  3. The signal: one aborted already makes no call; aborting during a wait clears the
+     timer and rejects with the signal's reason (an `AbortError` when none was given);
+     a call in progress is not interrupted, its value still stands and an error it would
+     not retry is still rethrown, but a retryable one ends the run with the reason,
+     without `onRetry`.
+  4. Options are checked before the first call, a wrong one a `TypeError` (a rejection,
+     `withRetry` being async): `retries` a non-negative integer, the delays from 0 to
+     2^31 − 1 ms (`setTimeout` fires a longer wait at once), `factor` finite and at least
+     1, hooks functions, `signal` an object with `addEventListener`. A first wait above
+     `maxDelayMs` is cut to it.
+  5. `checkHealth` reports a rejection that is not a `SqlError` (a `TypeError` from a
+     refused call, a raw error from a driver that does not wrap) as one, classified for
+     the driver's dialect, with the original as `cause`; a thrown value that cannot even
+     be read is a `SqlError` of kind `unknown`. So it never rejects, which the monitor
+     relies on: a rejection there would be unhandled. A `db` that is not a driver (no
+     `query`, or a dialect not known) is a `TypeError` thrown at the call.
+  6. `latencyMs` is `performance.now()`'s, fractional and monotonic, and `null` when the
+     check failed (the prior implementation timed failures too, so a connection timeout
+     read as latency). `checkedAt` is when the check was sent.
+  7. `onChange` is called with the first status and a `previous` of `null`, as its type
+     allows, then only on a flip; `previous` is the check before, a repeat included.
+     `last()` is set before `onChange` runs and kept across `stop()`, so a restart whose
+     first status did not flip calls nothing. A check in progress at `stop()` (or from a
+     run since restarted) is dropped: not reported, nothing scheduled. `start()` while
+     running answers that run's first check.
+  8. `intervalMs` is above 0 and at most 2^31 − 1; the next check starts that long after
+     the previous one settled, so checks never overlap. A check has no timeout of its
+     own: one that never answers holds the monitor, bounded only by the driver's own
+     timeouts. T12 decides whether `checkHealth` takes a `timeoutMs`.
+  9. The `driver` body has two health cases: a live driver is healthy, and a closed one is
+     unhealthy with a `SqlError` of its dialect, the check still resolving.
 
 ## How to resume (for a fresh conversation)
 

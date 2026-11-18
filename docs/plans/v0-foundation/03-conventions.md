@@ -240,7 +240,8 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
   ```
 
   The monitor's timer never keeps a process alive (`timer.unref?.()`), `onChange` fires
-  only when `healthy` flips, and an `onChange` that throws is caught.
+  only when `healthy` flips (and once with the first status, `previous` `null`, D33), and
+  an `onChange` that throws is caught.
 - **Done when** — `test/unit/retry.test.ts` passes: a retryable error is retried up to
   `retries` and then rethrown; a non-retryable one is rethrown at once; the delays follow
   `factor` and stop at `maxDelayMs`; an aborted signal ends the wait.

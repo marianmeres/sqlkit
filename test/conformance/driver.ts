@@ -1,5 +1,6 @@
 // The `driver` conformance body: the contract's rules R1–R10 (plan doc 01 #2), at least one
-// case per rule, on every registered adapter (plan doc 02 #2). Ported from the prior
+// case per rule, and `checkHealth` on a live and on a closed driver (plan doc 03 #3), on
+// every registered adapter (plan doc 02 #2). Ported from the prior
 // implementation's driver conformance file
 // (tmp/prior-art/engine/test/conformance/00-driver.test.ts), without its changeLock, json
 // and likePrefix groups.
@@ -11,7 +12,7 @@
 // says so and asserts each side.
 
 import assert from "node:assert/strict";
-import { type Driver, sql } from "../../src/mod.ts";
+import { checkHealth, type Driver, SqlError, sql } from "../../src/mod.ts";
 import type { AdapterCase, Suite } from "./_suite.ts";
 
 /** A promise and the function that resolves it: a gate a case opens by hand. */
@@ -661,5 +662,25 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 			"insert into t (id, name) values ('returned', 'r') returning id",
 		);
 		assert.equal(Object.getPrototypeOf(returned.rows[0]), Object.prototype);
+	});
+
+	// Health (plan doc 03 #3): the one `select 1` a check sends runs on every adapter, and a
+	// driver that can no longer answer is reported, not thrown.
+	test("health: a live driver is healthy", async (db) => {
+		const status = await checkHealth(db);
+		assert.equal(status.healthy, true);
+		assert.equal(status.error, null);
+		assert.equal(typeof status.latencyMs, "number");
+		assert.ok((status.latencyMs ?? -1) >= 0);
+		assert.ok(status.checkedAt instanceof Date);
+	});
+
+	test("health: a closed driver is unhealthy, and the check still resolves", async (db) => {
+		await db.close();
+		const status = await checkHealth(db);
+		assert.equal(status.healthy, false);
+		assert.equal(status.latencyMs, null);
+		assert.ok(status.error instanceof SqlError, String(status.error));
+		assert.equal(status.error.dialect, db.dialect);
 	});
 }

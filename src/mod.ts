@@ -47,7 +47,14 @@ export {
 	toSqlError,
 	UniqueViolationError,
 } from "./core/errors.ts";
+export {
+	checkHealth,
+	createHealthMonitor,
+	type HealthMonitor,
+	type HealthStatus,
+} from "./core/health.ts";
 export { normalizeParam, normalizeParams } from "./core/params.ts";
+export { type RetryOptions, withRetry } from "./core/retry.ts";
 export {
 	bind,
 	EMPTY,
