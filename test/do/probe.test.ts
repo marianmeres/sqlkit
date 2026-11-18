@@ -346,11 +346,68 @@ describe("do/probe: probes", () => {
 			order: ["peek", "hold"],
 			read: { rows: ["hold", "peek"] },
 		});
-		assert.deepEqual(inTransaction, {
+		// That `peek` ran only once `hold` had finished is `peek.hold`, read inside the
+		// object. Which of the two responses then reaches Node first is not pinned: both are
+		// released together, and under load either arrives first (seen at T19).
+		const { order, ...held } = inTransaction;
+		assert.deepEqual(held, {
 			hold: { seenAfterTimer: ["hold"] },
 			peek: { hold: "finished", seen: [] },
-			order: ["hold", "peek"],
 			read: { rows: ["peek"] },
 		});
+		assert.deepEqual([...order].sort(), ["hold", "peek"]);
+	});
+
+	test("P9 (F15): a deferred foreign key is checked when the request ends, and a violation resets the object", async (t) => {
+		// What a call answers: its value, or the message it was refused with.
+		const outcome = (name: string, payload: unknown, object: string) =>
+			call(name, payload, object).then(
+				(value) => ({ value }),
+				(error: unknown) => ({ refused: String((error as Error).message) }),
+			);
+		const answers: Record<string, unknown> = {};
+		const refusals: Record<string, string> = {};
+		for (const mode of ["sync", "async", "bare", "fix"]) {
+			const object = `p9-${mode}-${randomUUID()}`;
+			await call("p9-setup", null, object);
+			const answer =
+				mode === "fix"
+					? await outcome("p9-fix", null, object)
+					: await outcome("p9-violate", { mode }, object);
+			if ("refused" in answer) refusals[mode] = answer.refused;
+			answers[mode] = {
+				answer: "refused" in answer ? "refused" : answer.value,
+				after: await call("p9-read", null, object),
+			};
+		}
+		record(t, { answers, refusals });
+
+		// Every violating mode fails the request after its handler returned (HTTP 500, no
+		// JSON envelope: nothing threw where the handler could see it), and the object is
+		// back to the state before that request: no orphan, the parent still there.
+		const before = { children: 0, parents: 1 };
+		assert.deepEqual(answers, {
+			sync: { answer: "refused", after: before },
+			async: { answer: "refused", after: before },
+			bare: { answer: "refused", after: before },
+			fix: { answer: { returned: "fix" }, after: { children: 1, parents: 2 } },
+		});
+		const reset =
+			"Durable Object was reset and rolled back to its last known good state because " +
+			"the application left the database in a state where constraints were violated: " +
+			"FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)";
+		for (const mode of ["sync", "bare"]) {
+			assert.ok(
+				refusals[mode]?.startsWith(
+					`p9-violate: HTTP 500, not JSON: Error: ${reset}`,
+				),
+				`${mode}: ${refusals[mode]}`,
+			);
+		}
+		// The async transaction's request fails with an opaque internal error instead.
+		assert.match(
+			refusals.async ?? "",
+			/^p9-violate: HTTP 500, not JSON: Error: internal error; reference = \w+/,
+		);
 	});
 });

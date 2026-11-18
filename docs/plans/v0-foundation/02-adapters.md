@@ -427,7 +427,8 @@ no adapter imports a driver library, not even its types.
   The sync tier's `SyncBackend` is `storage.sql.exec` and `storage.transactionSync`. The
   async tier is the single-connection core over `storage.transaction`. Parameters, the
   affected-row count and the classifier follow F-entries P3, P4 and P5. `close()` does
-  nothing. Capabilities: `{ sync: true, concurrentWriters: false, crossProcessLock: false }`.
+  nothing (**changed by D40.7**: it ends the driver, and leaves the storage as it is).
+  Capabilities: `{ sync: true, concurrentWriters: false, crossProcessLock: false }`.
   The adapter requires the `nodejs_compat` flag (D24, confirmed at T12).
 
   What the T12 review decided from `DO-FINDINGS.md` (D34.7):
@@ -435,7 +436,8 @@ no adapter imports a driver library, not even its types.
   - **Read-only transactions are enforced by detection** (F12: `query_only` is not
     authorized). Inside a read-only transaction, on either tier, a statement whose cursor
     reports `rowsWritten > 0` (read right after `sql.exec`, F10) throws a
-    `ReadOnlyError` (kind `read_only`, no code). The backend remembers it, and its
+    `ReadOnlyError` (kind `read_only`, no code; **changed by D40.3**: code `8`, and
+    `total_changes()` is read too, D40.2). The backend remembers it, and its
     transaction throws a `ReadOnlyError` again once the callback has returned, still
     inside `storage.transaction` or `transactionSync`, so the write rolls back even when
     the callback caught the first one. Check first that a read reports no rows written:
@@ -461,7 +463,8 @@ no adapter imports a driver library, not even its types.
   - **R11** (D34.1). F01: `sql.exec` with no bindings runs every statement of a text. If
     the backend finds a way to refuse a text of several before any of it runs, use it; if
     not, list R11's case under `except` with F01 as its reason. Do not split or parse SQL
-    to get there.
+    to get there. **Settled by D40.4: excepted.** T19 also found F15 and excepted the
+    `errors` body's two deferred-constraint cases with it (D40.5).
 
   The conformance bodies run inside workerd: `test/do/worker/conformance.ts` is a Durable
   Object that collects the cases of a named body into an in-memory `Suite`, runs them

@@ -8,6 +8,7 @@ Every export of every entry point. Each entry point is its own subpath export:
 | [`@marianmeres/sqlkit/sqlite`](#marianmeressqlkitsqlite)              | the node:sqlite adapter, with the sync tier                                           |
 | [`@marianmeres/sqlkit/pg`](#marianmeressqlkitpg)                      | the node-postgres adapter: over a pool, or over one client                            |
 | [`@marianmeres/sqlkit/pglite`](#marianmeressqlkitpglite)              | the PGlite adapter                                                                    |
+| [`@marianmeres/sqlkit/do`](#marianmeressqlkitdo)                      | the Durable Objects adapter, with the sync tier                                       |
 | [`@marianmeres/sqlkit/migrate`](#marianmeressqlkitmigrate)            | `@marianmeres/migrate` wired over a `Driver`                                          |
 | [`@marianmeres/sqlkit/migrate/files`](#marianmeressqlkitmigratefiles) | SQL files as migration versions (Node only)                                           |
 
@@ -18,8 +19,8 @@ Two rules hold across all of them:
   contract refuses) is a `TypeError`, never wrapped. What a caller's own callback threw
   comes out as it was thrown.
 - No adapter imports its driver library. The host builds the client; the adapter declares
-  the shape it takes structurally (`PgPoolLike`, `PgliteLike`), so the package has no peer
-  dependency.
+  the shape it takes structurally (`PgPoolLike`, `PgliteLike`, `DoStorageLike`), so the
+  package has no peer dependency.
 
 ---
 
@@ -164,7 +165,7 @@ A database, asynchronously. Every adapter's factory returns one.
 ```ts
 interface Driver {
 	readonly dialect: DialectName;
-	readonly adapter: string; // "node:sqlite", "pg", "pg-client", "pglite"
+	readonly adapter: string; // "node:sqlite", "pg", "pg-client", "pglite", "durable-objects"
 	readonly capabilities: Capabilities;
 	query<T = Row>(statement: Sql): Promise<QueryResult<T>>;
 	query<T = Row>(text: string, params?: readonly unknown[]): Promise<QueryResult<T>>;
@@ -190,19 +191,19 @@ The callback of `transaction` and `exclusive` receives the driver itself: which
 transaction a statement is in is decided by the async context it was issued from, not by
 the handle. The rules every adapter is held to:
 
-| Rule | Behaviour                                                                                                                                                                                |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1   | `query` and `exec` always answer with a promise: a failing statement rejects, it never throws at the call.                                                                               |
-| R2   | `rowCount` is as `QueryResult` says, for a `SELECT`, a plain write and a write with `RETURNING`.                                                                                         |
-| R3   | `transaction` commits when `fn` resolves and rolls back when it rejects. On `pg` a callback that swallowed a failed statement gets a `TransactionAbortedError`; SQLite commits the rest. |
-| R4   | A nested `transaction` joins the open one, as it was opened.                                                                                                                             |
-| R5   | A statement belongs to the transaction whose callback issued it, and to no other: one from elsewhere neither sees its uncommitted rows nor goes with its rollback.                       |
-| R6   | "Inside" ends when the callback settles: a promise that outlives its transaction writes outside it.                                                                                      |
-| R7   | `readOnly` reads one snapshot and refuses a write.                                                                                                                                       |
-| R8   | `exclusive` serializes callers of one name, is re-entrant, lets two names run together, releases on rejection, and inside an open transaction belongs to that transaction.               |
-| R9   | `exec` runs every statement of a script and joins the open transaction.                                                                                                                  |
-| R10  | Parameters follow the [parameter rule](#parameters). Rows are plain objects. Bytes read back as a `Uint8Array`.                                                                          |
-| R11  | `query` runs one statement: a text holding more is refused before any of it runs. Blanks, semicolons and comments after it are not a statement. A script goes through `exec`.            |
+| Rule | Behaviour                                                                                                                                                                                                                                          |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1   | `query` and `exec` always answer with a promise: a failing statement rejects, it never throws at the call.                                                                                                                                         |
+| R2   | `rowCount` is as `QueryResult` says, for a `SELECT`, a plain write and a write with `RETURNING`.                                                                                                                                                   |
+| R3   | `transaction` commits when `fn` resolves and rolls back when it rejects. On `pg` a callback that swallowed a failed statement gets a `TransactionAbortedError`; SQLite commits the rest.                                                           |
+| R4   | A nested `transaction` joins the open one, as it was opened.                                                                                                                                                                                       |
+| R5   | A statement belongs to the transaction whose callback issued it, and to no other: one from elsewhere neither sees its uncommitted rows nor goes with its rollback.                                                                                 |
+| R6   | "Inside" ends when the callback settles: a promise that outlives its transaction writes outside it.                                                                                                                                                |
+| R7   | `readOnly` reads one snapshot and refuses a write.                                                                                                                                                                                                 |
+| R8   | `exclusive` serializes callers of one name, is re-entrant, lets two names run together, releases on rejection, and inside an open transaction belongs to that transaction.                                                                         |
+| R9   | `exec` runs every statement of a script and joins the open transaction.                                                                                                                                                                            |
+| R10  | Parameters follow the [parameter rule](#parameters). Rows are plain objects. Bytes read back as a `Uint8Array`.                                                                                                                                    |
+| R11  | `query` runs one statement: a text holding more is refused before any of it runs. Blanks, semicolons and comments after it are not a statement. A script goes through `exec`. Not on [Durable Objects](#marianmeressqlkitdo), which runs them all. |
 
 ```ts
 const id = await db.transaction(async (tx) => {
@@ -232,11 +233,11 @@ interface SyncDriver {
 ```
 
 A database, synchronously: `driver.sync`, on an adapter whose engine is synchronous
-underneath (node:sqlite). Its transaction callback is synchronous, which is the point of
-it: an async callback returns at its first `await` and would leave the transaction open.
-It is the same connection as the async tier, so the two refuse each other where a call
-would land in the wrong transaction. A refused sync call throws its `TypeError` at the
-call; a database failure throws its `SqlError`.
+underneath (node:sqlite, Durable Objects). Its transaction callback is synchronous, which
+is the point of it: an async callback returns at its first `await` and would leave the
+transaction open. It is the same connection as the async tier, so the two refuse each
+other where a call would land in the wrong transaction. A refused sync call throws its
+`TypeError` at the call; a database failure throws its `SqlError`.
 
 | Rule | Behaviour                                                                                                                          |
 | ---- | ---------------------------------------------------------------------------------------------------------------------------------- |
@@ -292,12 +293,13 @@ interface Capabilities {
 
 What an adapter's dialect does not already tell.
 
-| `adapter`       | `sync` | `concurrentWriters` | `crossProcessLock` |
-| --------------- | ------ | ------------------- | ------------------ |
-| `"node:sqlite"` | true   | false               | false              |
-| `"pg"`          | false  | true                | true               |
-| `"pg-client"`   | false  | false               | true               |
-| `"pglite"`      | false  | false               | false              |
+| `adapter`           | `sync` | `concurrentWriters` | `crossProcessLock` |
+| ------------------- | ------ | ------------------- | ------------------ |
+| `"node:sqlite"`     | true   | false               | false              |
+| `"pg"`              | false  | true                | true               |
+| `"pg-client"`       | false  | false               | true               |
+| `"pglite"`          | false  | false               | false              |
+| `"durable-objects"` | true   | false               | false              |
 
 #### `DialectName`
 
@@ -483,7 +485,10 @@ node-postgres's connection timeout and terminated connection read as `connection
 
 Which kind a SQLite driver's error is, by its extended result code (node:sqlite's
 `errcode`), with the subject parsed from the message, since SQLite reports no constraint
-fields. An error without one did not come from SQLite and is `unknown`.
+fields. An error with no `errcode` is read from the code names its message ends with, as a
+Durable Object's errors carry them (`…: SQLITE_CONSTRAINT (extended:
+SQLITE_CONSTRAINT_UNIQUE)`): the most specific name gives the kind and the code. An error
+with neither did not come from SQLite and is `unknown`.
 
 **Returns:** `SqlErrorInfo`
 
@@ -976,6 +981,72 @@ The shapes the adapter takes: a `PGlite` instance fits `PgliteLike` as it is.
 
 ---
 
+## `@marianmeres/sqlkit/do`
+
+The Durable Objects adapter, over the SQLite storage of a Durable Object (`ctx.storage`).
+Its dialect is `sqlite`. The storage is one connection, under the single-connection rule,
+and its engine is synchronous, so the driver has the [sync tier](#syncdriver): `driver.sync`
+is the same storage, answering at once. The async tier's transaction is
+`storage.transaction`, the sync tier's `storage.transactionSync`; no lock other objects
+honour.
+
+**It requires the `nodejs_compat` compatibility flag**: the driver carries a transaction
+in `AsyncLocalStorage`, from `node:async_hooks`. Nothing is imported from workerd.
+
+Where workerd makes it differ from node:sqlite:
+
+| What                      | On Durable Objects                                                                                                                                                                                                                                                                               |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| An open async transaction | Holds the whole object: no other request reaches it until the transaction settles, even while it awaits a timer or a `fetch`. Do not await external I/O inside one.                                                                                                                              |
+| R11                       | Not enforced: `query()` with a text of several statements runs them all, since workerd has no way to refuse one before it runs. Pass one statement to `query()`, a script to `exec()`.                                                                                                           |
+| Transaction statements    | `BEGIN`, `SAVEPOINT`, `COMMIT` and `ROLLBACK` are refused by workerd, in a script too: a migration file cannot hold its own.                                                                                                                                                                     |
+| `readOnly`                | Enforced by detection: a statement that wrote throws a `ReadOnlyError` (code `"8"`, as node:sqlite's), and the transaction throws it again once its callback returns, so the write rolls back even when the callback caught the first. DDL that is not the last statement of a text goes unseen. |
+| A deferred constraint     | Not checked when `transaction()` ends: workerd checks it when the request ends, and a violation resets the object to its last good state and fails the request. Keep foreign keys immediate.                                                                                                     |
+| `bigint` parameters       | Bound as the number they equal, since workerd binds no `bigint`; one outside the safe-integer range is a `TypeError`. Every number binds as a `real`; an `integer` column stores it as an integer.                                                                                               |
+| Rows                      | A blob reads back as a `Uint8Array` over the bytes workerd hands back as an `ArrayBuffer`. An integer reads back as a number, rounded beyond 2^53.                                                                                                                                               |
+| `close()`                 | Ends the driver: every call after it fails with a `SqlError`. The storage belongs to the object and stays as it is.                                                                                                                                                                              |
+
+### `createDoDriver(storage)`
+
+A driver over a SQLite-backed Durable Object's storage. Anything without `sql.exec`,
+`transaction` and `transactionSync` is a `TypeError`.
+
+- `storage` (`DoStorageLike`): the object's `ctx.storage`.
+
+**Returns:** `Driver`, adapter `"durable-objects"`, with `sync`.
+
+```ts
+import { DurableObject } from "cloudflare:workers";
+import { createDoDriver } from "@marianmeres/sqlkit/do";
+
+export class Room extends DurableObject {
+	db = createDoDriver(this.ctx.storage);
+}
+```
+
+### `DoStorageLike`, `DoSqlStorageLike`, `DoSqlCursorLike`
+
+```ts
+interface DoSqlCursorLike {
+	toArray(): Record<string, unknown>[];
+	readonly columnNames: readonly string[];
+	readonly rowsWritten: number;
+}
+interface DoSqlStorageLike {
+	exec(query: string, ...bindings: unknown[]): DoSqlCursorLike;
+}
+interface DoStorageLike {
+	readonly sql: DoSqlStorageLike;
+	transactionSync<T>(closure: () => T): T;
+	transaction<T>(closure: () => Promise<T>): Promise<T>;
+}
+```
+
+The shapes the adapter takes: a Durable Object's `ctx.storage` fits `DoStorageLike` as it
+is.
+
+---
+
 ## `@marianmeres/sqlkit/migrate`
 
 [`@marianmeres/migrate`](https://www.npmjs.com/package/@marianmeres/migrate) wired over a
@@ -989,12 +1060,12 @@ every version through `db`. Register versions with `addVersion(version, up, down
 [`addSqlFiles`](#addsqlfilesmigrate-dir)), then `up()`, `down()`, `status()`: the
 migrate package's own API.
 
-| Hook               | `capabilities.crossProcessLock` true (`pg`, `pg-client`) | otherwise (`node:sqlite`, `pglite`)    |
-| ------------------ | -------------------------------------------------------- | -------------------------------------- |
-| `wrapRun`          | `db.exclusive("migrate:<table>", run)`                   | `db.transaction(run)`                  |
-| `wrapStep`         | `db.transaction(run)`, committed per step                | `db.transaction(run)`, joining the run |
-| `getActiveVersion` | the newest row; `null` while no table exists             | same                                   |
-| `setActiveVersion` | one insert, under the run lock                           | same                                   |
+| Hook               | `capabilities.crossProcessLock` true (`pg`, `pg-client`) | otherwise (`node:sqlite`, `pglite`, `durable-objects`) |
+| ------------------ | -------------------------------------------------------- | ------------------------------------------------------ |
+| `wrapRun`          | `db.exclusive("migrate:<table>", run)`                   | `db.transaction(run)`                                  |
+| `wrapStep`         | `db.transaction(run)`, committed per step                | `db.transaction(run)`, joining the run                 |
+| `getActiveVersion` | the newest row; `null` while no table exists             | same                                                   |
+| `setActiveVersion` | one insert, under the run lock                           | same                                                   |
 
 Where the lock crosses processes a failed step is undone alone, and the steps before it
 stay. Elsewhere the run is one transaction, and a failed step undoes the whole run. The

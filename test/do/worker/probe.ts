@@ -624,6 +624,44 @@ const handlers: Record<string, Handler> = {
 	"p8-read"({ storage: { sql } }) {
 		return { rows: values(sql) };
 	},
+
+	// P9 (added at T19): when does workerd check a deferred foreign key? Handlers on one
+	// object: setup, one of the `p9-violate` modes, then `p9-read`. A violation inside
+	// `transactionSync` or `transaction` that the closure leaves unfixed is not refused
+	// when the closure ends: the handler returns, and only then does the request fail. A
+	// mode that throws inside the handler would answer a JSON envelope instead, so the
+	// test tells the two apart by the answer's shape. `p9-fix` repairs the reference later
+	// in the same request, outside the transaction.
+	"p9-setup"({ storage: { sql } }) {
+		sql.exec(
+			"create table parent (id integer primary key);" +
+				"create table child (id integer primary key, p integer references parent (id) deferrable initially deferred);" +
+				"insert into parent values (1)",
+		);
+		return null;
+	},
+	async "p9-violate"({ storage }, payload) {
+		const { mode } = payload as { mode: "sync" | "async" | "bare" };
+		const orphan = () => storage.sql.exec("insert into child values (1, 99)");
+		if (mode === "sync") storage.transactionSync(orphan);
+		else if (mode === "async") await storage.transaction(async () => orphan());
+		else orphan();
+		return { returned: mode };
+	},
+	"p9-fix"({ storage }) {
+		storage.transactionSync(
+			() => storage.sql.exec("insert into child values (2, 7)").rowsWritten,
+		);
+		storage.sql.exec("insert into parent values (7)");
+		return { returned: "fix" };
+	},
+	"p9-read"({ storage: { sql } }) {
+		return sql
+			.exec<{ children: SqlStorageValue; parents: SqlStorageValue }>(
+				"select (select count(*) from child) as children, (select count(*) from parent) as parents",
+			)
+			.one();
+	},
 };
 
 export class TestObject extends DurableObject {

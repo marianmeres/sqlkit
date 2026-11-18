@@ -1,9 +1,10 @@
 # @marianmeres/sqlkit — Agent Guide
 
-A thin, convention-driven SQL toolkit for PostgreSQL and SQLite: `sql` fragments that keep
-text and values apart, one driver contract (async, plus a sync tier where the engine is
-synchronous), typed errors, transactions, statement builders, row decoders, retry, health
-checks and migrations. Not an ORM, not a query builder. An app commits to one dialect.
+A thin, convention-driven SQL toolkit for PostgreSQL and SQLite (node:sqlite, node-postgres,
+PGlite, Durable Objects): `sql` fragments that keep text and values apart, one driver
+contract (async, plus a sync tier where the engine is synchronous), typed errors,
+transactions, statement builders, row decoders, retry, health checks and migrations. Not
+an ORM, not a query builder. An app commits to one dialect.
 
 ## Quick Reference
 
@@ -11,7 +12,8 @@ checks and migrations. Not an ORM, not a query builder. An app commits to one di
   pnpm, Biome, `node:test`. Published to npm only, `access: restricted` during 0.x.
 - **Gate**: `pnpm run ci` (typecheck, lint, test) | **Test**: `pnpm test` |
   **Build**: `pnpm run build` (`dist/`, for npm only) | **Format**: `pnpm run format`
-- **One adapter**: `pnpm run test:sqlite`, `test:pg` (pool and client), `test:pglite`
+- **One adapter**: `pnpm run test:sqlite`, `test:pg` (pool and client), `test:pglite`,
+  `test:do` (Durable Objects, in workerd)
 - **Test database**: a real Postgres from `TEST_PG_*` in `.env` (see `.env.example`).
   Missing, the suite fails; nothing skips. The role needs `CREATE` on the database: every
   Postgres case makes a schema of its own.
@@ -28,12 +30,13 @@ checks and migrations. Not an ORM, not a query builder. An app commits to one di
 | `src/sqlite/mod.ts`                        | `./sqlite`        | node:sqlite (with the sync tier)                                                    |
 | `src/pg/mod.ts`                            | `./pg`            | node-postgres: a pool, or one client                                                |
 | `src/pglite/mod.ts`                        | `./pglite`        | PGlite                                                                              |
+| `src/do/mod.ts`                            | `./do`            | Durable Objects SQLite storage (with the sync tier; needs `nodejs_compat`)          |
 | `src/migrate/mod.ts`                       | `./migrate`       | `@marianmeres/migrate` wired over a `Driver`                                        |
 | `src/migrate/files.ts`                     | `./migrate/files` | SQL files as versions (Node only)                                                   |
 | `test/conformance/`                        |                   | bodies every adapter runs, their binders, the registry                              |
 | `test/unit/`                               |                   | no database: pure functions, stub backends, guards                                  |
 | `test/pg/`, `test/pglite/`, `test/sqlite/` |                   | one adapter's own suites and fixture                                                |
-| `test/do/`                                 |                   | workerd harness and the Durable Objects probe                                       |
+| `test/do/`                                 |                   | workerd harness, the probe, every body run in workerd, the `do` adapter's own suite |
 
 ## Critical Conventions
 

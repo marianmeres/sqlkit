@@ -65,7 +65,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
 | ✅ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
 | ✅ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
-| ⬜ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 D34 | — |
+| ✅ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 D34 D40 | — |
 | ⬜ | T20 | T19 | Archive this plan set; copy the backlog to `docs/backlog.md` | [04](./04-scaffold-docs-release.md) #4 | D22 | — |
 
 Row order is run order. T19 comes after the docs rows on purpose: if it blocks, the
@@ -627,6 +627,59 @@ D34 changes says so where it stands.
   5. `AGENTS.md` (checklist, index) and `docs/tasks.md` (add an adapter, add an error
      kind) now name `README.md`, `API.md` and the two tests, since following them as they
      were would fail `api-docs`.
+
+- **D40** (2026-11-18, T19 session) — Found while building the Durable Objects adapter;
+  open to veto ([02](./02-adapters.md) #7). Probed in workerd 1.20260730.1 first; the
+  findings are in `DO-FINDINGS.md` (the T19 notes under F10, and F15).
+  1. **A read reports no rows written**, sorts and groupings included, so read-only is
+     enforced by detection as D34.7.1 decided, and R7's write case is not excepted.
+  2. **Detection reads `total_changes()` too.** A text's cursor reports its last
+     statement's `rowsWritten` only, and R11 does not hold here, so `insert …; select 1`
+     in a read-only transaction would have committed. Inside a read-only transaction the
+     backend also compares `total_changes()` with its value when the transaction began:
+     one more statement per statement, in read-only transactions only. DDL that is not a
+     text's last statement is the gap left (neither counter sees it; `PRAGMA
+     schema_version` is not authorized), and the docs say so.
+  3. **The refusal carries code `8`** (changes 02 #7's "no code"). The `errors` body holds
+     every `sqlite` adapter to one shape: a `ReadOnlyError` of code `"8"` whose `cause` is
+     an `Error` `classifySqlite` reads the same. The backend throws an `Error` with
+     `errcode: 8` (`SQLITE_READONLY`, what node:sqlite's `query_only` raises), the core
+     wraps it like any other, and `code === "8"` holds on both SQLite adapters. Its
+     message starts as SQLite's does: "attempt to write a readonly database".
+  4. **R11 is excepted, with F01.** `sql` has `exec` and `databaseSize`, no `prepare`, and
+     a wrong count of values is reported only at the last statement, after the others
+     ran. No SQL is split or parsed.
+  5. **F15 is new**: a deferred foreign key is checked when the request ends, and a
+     violation resets the object (P9 pins it). The `errors` body's two cases of a
+     constraint `COMMIT` checks are excepted with it; the docs tell a host to keep foreign
+     keys immediate.
+  6. **How an exception is reported.** `AdapterCase` gains `except`, a map of case name to
+     reason. The workerd runner does not run an excepted case: it registers it as a
+     `node:test` skip whose reason is the finding, and a separate case fails when an entry
+     names no case of any body. Not running it, rather than requiring it to fail, because
+     the F15 cases would reset their object and fail the request instead of reporting; a
+     reason that stops holding fails its pinning probe in `test/do/probe.test.ts`. The
+     `do` registry entry is the worker (`test/do/worker/conformance.ts`), since its
+     database exists only there; the Node registry keeps the adapters Node runs.
+  7. **`close()` ends the driver** (02 #7 said it does nothing). The storage, which is the
+     object's, is left as it is, and every call after `close()` fails with a `SqlError`
+     of kind `unknown`, as on a closed node:sqlite handle: the `driver` body's
+     closed-driver health case requires an unhealthy check.
+  8. **A `bigint` bound as a number** is a `real` to workerd, as every number is (F09); an
+     `integer` column stores it as an integer. The `TypeError` for one beyond the
+     safe-integer range says why in words instead of naming F09, which a user cannot look
+     up; the source comment cites F09.
+  9. The adapter is named `"durable-objects"` (`Driver.adapter`); the registry name is
+     `do`, its cases under `describe("do")`. `pnpm run test:do` runs `test/do/`. What only
+     this adapter does is `test/do/adapter.test.ts`: a swallowed read-only write still
+     rolls back, a write before a text's last statement is refused, sorting and grouping
+     reads are not, `bigint`, `close()` and the storage check.
+  10. **P8 no longer pins the order its two responses arrive in.** With three workerd
+     suites running beside the Postgres ones, the in-transaction run's responses arrived
+     peek first in one full run of five, though peek had run only after hold finished
+     (`peek.hold` was `"finished"`, `seen` empty): both responses are released once the
+     transaction ends, and the transport orders them as it likes. P8 still pins that peek
+     ran after hold's transaction, and the control's order, which an 800 ms timer decides.
 
 ## How to resume (for a fresh conversation)
 

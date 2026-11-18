@@ -1,8 +1,9 @@
 # @marianmeres/sqlkit
 
 A thin SQL toolkit for PostgreSQL and SQLite: `sql` fragments that keep text and values
-apart, one driver contract over node:sqlite, node-postgres and PGlite, typed errors,
-transactions, statement builders, row decoders, retry, health checks and migrations.
+apart, one driver contract over node:sqlite, node-postgres, PGlite and the SQLite storage
+of Cloudflare Durable Objects, typed errors, transactions, statement builders, row
+decoders, retry, health checks and migrations.
 
 ## What it is, and what it is not
 
@@ -37,11 +38,12 @@ npm install @marianmeres/sqlkit
 Node 24.12 or later. Then the client of your database, which you build and hand to the
 adapter: sqlkit imports no driver and has no peer dependency.
 
-| Database           | Client to install                  |
-| ------------------ | ---------------------------------- |
-| SQLite             | nothing: `node:sqlite` is built in |
-| Postgres           | `npm install pg`                   |
-| PGlite (in memory) | `npm install @electric-sql/pglite` |
+| Database                 | Client to install                                    |
+| ------------------------ | ---------------------------------------------------- |
+| SQLite                   | nothing: `node:sqlite` is built in                   |
+| Postgres                 | `npm install pg`                                     |
+| PGlite (in memory)       | `npm install @electric-sql/pglite`                   |
+| Durable Objects (SQLite) | nothing: the object's `ctx.storage`, `nodejs_compat` |
 
 ## Quick start
 
@@ -54,9 +56,10 @@ that is the same on all of them.
 | `@marianmeres/sqlkit/pg`     | `createPgDriver(pool, options)`                       | `pg`     | no        | a pool         |
 | `@marianmeres/sqlkit/pg`     | `createPgClientDriver(client, options)`               | `pg`     | no        | one connection |
 | `@marianmeres/sqlkit/pglite` | `createPgliteDriver(db)`                              | `pg`     | no        | one connection |
+| `@marianmeres/sqlkit/do`     | `createDoDriver(ctx.storage)`                         | `sqlite` | yes       | one connection |
 
 `close()` ends the client the adapter was given. A host that keeps its client does not
-call it.
+call it. On Durable Objects it ends the driver and leaves the object's storage as it is.
 
 ### SQLite (node:sqlite)
 
@@ -112,6 +115,40 @@ const db = createPgliteDriver(await PGlite.create());
 Postgres compiled to WebAssembly, in this process: the in-memory database for testing
 code that runs on Postgres.
 
+### Durable Objects
+
+```ts
+import { DurableObject } from "cloudflare:workers";
+import { createDoDriver } from "@marianmeres/sqlkit/do";
+
+export class Room extends DurableObject {
+	db = createDoDriver(this.ctx.storage);
+}
+```
+
+The storage of a SQLite-backed Durable Object. The Worker needs the `nodejs_compat`
+compatibility flag: the driver carries a transaction in `AsyncLocalStorage`. `db.sync` is
+the same storage, synchronously, and its `transaction` is `storage.transactionSync`.
+Where workerd differs from node:sqlite:
+
+- **An async transaction holds the whole object.** While it is open, no other request
+  reaches the object, even while it awaits a timer or a `fetch`. Do not await external
+  I/O inside one: do the I/O first, then open the transaction.
+- **`query` cannot refuse a text of several statements**: workerd runs every statement of
+  a text given no values. Pass one statement to `query`, a script to `exec`.
+- **A script cannot hold its own transaction**: workerd refuses `BEGIN`, `SAVEPOINT`,
+  `COMMIT` and `ROLLBACK`, a migration file's included. `transaction` is the way.
+- **A read-only transaction detects a write after it ran** (workerd does not authorize
+  `PRAGMA query_only`) and rolls the transaction back, rejecting with a `ReadOnlyError`
+  even when the callback caught the first one. DDL that is not the last statement of a
+  text goes unseen.
+- **A deferred constraint is not checked by `transaction`.** workerd checks a
+  `deferrable initially deferred` foreign key when the request ends, and a violation then
+  resets the object to its last good state and fails the request. Keep foreign keys
+  immediate.
+- **A `bigint` binds as a number**, since workerd binds no `bigint`; one outside the
+  safe-integer range is a `TypeError`. An integer column reads back as a number.
+
 ## Queries
 
 ```ts
@@ -136,8 +173,9 @@ const { rows, rowCount } = await db.query(
   fragment is spliced, with its own values.
 - `ident("app", "job")` quotes an identifier, `raw("now()")` is literal SQL your code owns,
   `json(value)` binds JSON text, `join(parts, ", ")` and `bind(value)` build lists.
-- `query` runs **one** statement; a text holding more is refused before any of it runs.
-  A script goes through `exec`, which takes no parameters.
+- `query` runs **one** statement; a text holding more is refused before any of it runs
+  (except on Durable Objects, which runs them all). A script goes through `exec`, which
+  takes no parameters.
 - `query("select … where id = $1", [id])` takes text and parameters too, in the dialect's
   placeholder style.
 - A row is a plain object. `rowCount` is the rows returned, or the rows a plain write
@@ -168,13 +206,13 @@ const id = await db.transaction(async (tx) => {
   `ReadOnlyError`.
 - `db.exclusive("name", fn)` runs `fn` holding a lock of that name. On Postgres it is an
   advisory lock every process on the database honours (`capabilities.crossProcessLock`);
-  on SQLite and PGlite it is a queue in this process.
+  on SQLite, PGlite and Durable Objects it is a queue in this process.
 
 ## The sync tier
 
 An async callback returns at its first `await`, so it cannot run inside a synchronous
-transaction. Where the engine is synchronous (node:sqlite), `db.sync` is the same
-connection answering at once:
+transaction. Where the engine is synchronous (node:sqlite, Durable Objects), `db.sync` is
+the same connection answering at once:
 
 ```ts
 const count = db.sync?.transaction((tx) => {
@@ -316,20 +354,21 @@ await migrate.up();
 
 ## Before you rely on it
 
-- **A single connection can wait for itself.** On node:sqlite, one `pg.Client` and PGlite,
-  a statement issued during a transaction from a context that lost it (a callback handed
-  to an event emitter, or to a queue created outside the transaction) waits for the
-  transaction, and the transaction waits for it. The context follows `await`; bind such a
-  callback inside the transaction (`AsyncLocalStorage.bind`). A pool does not wait, but
-  that statement runs outside the transaction there too.
+- **A single connection can wait for itself.** On node:sqlite, one `pg.Client`, PGlite and
+  Durable Objects, a statement issued during a transaction from a context that lost it (a
+  callback handed to an event emitter, or to a queue created outside the transaction)
+  waits for the transaction, and the transaction waits for it. The context follows
+  `await`; bind such a callback inside the transaction (`AsyncLocalStorage.bind`). A pool
+  does not wait, but that statement runs outside the transaction there too.
 - **`withRetry` runs the whole function again.** Put it around one idempotent statement
   or a whole `transaction` call, never around part of a transaction: on Postgres the
   transaction is already aborted, and anywhere the statements before the failure are
   still in it.
 - **Migrations lock in one of two ways.** Where the driver's lock crosses processes
   (`createPgDriver`, `createPgClientDriver`) a run holds an advisory lock and commits step
-  by step: a failed step is undone alone. Elsewhere (node:sqlite, PGlite) the run is one
-  transaction: a failed step undoes the whole run, the steps before it included.
+  by step: a failed step is undone alone. Elsewhere (node:sqlite, PGlite, Durable Objects)
+  the run is one transaction: a failed step undoes the whole run, the steps before it
+  included.
 - **One active version is stored, not a ledger of applied steps.** `up()` runs the
   versions above the active one, in semver order. A version added later _below_ the
   active one is never applied, and never reported as pending.

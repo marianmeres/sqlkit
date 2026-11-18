@@ -32,6 +32,10 @@
       "types": "./dist/pglite/mod.d.ts",
       "import": "./dist/pglite/mod.js"
     },
+    "./do": {
+      "types": "./dist/do/mod.d.ts",
+      "import": "./dist/do/mod.js"
+    },
     "./migrate": {
       "types": "./dist/migrate/mod.d.ts",
       "import": "./dist/migrate/mod.js"
@@ -81,6 +85,7 @@
     "test:pg": "node --test --env-file-if-exists=.env --test-name-pattern=\"^pg\\\\b\" \"test/conformance/*.test.ts\" \"test/pg/*.test.ts\"",
     "test:pglite": "node --test --env-file-if-exists=.env --test-name-pattern=\"^pglite\\\\b\" \"test/conformance/*.test.ts\" \"test/pglite/*.test.ts\"",
     "test:sqlite": "node --test --env-file-if-exists=.env --test-name-pattern=\"^sqlite\\\\b\" \"test/conformance/*.test.ts\" \"test/sqlite/*.test.ts\"",
+    "test:do": "node --test --env-file-if-exists=.env \"test/do/*.test.ts\"",
     "ci": "pnpm run typecheck && pnpm run lint && pnpm test",
     "prepublishOnly": "pnpm run ci && pnpm run build",
     "release": "npx --yes @marianmeres/release@^2.2.0",

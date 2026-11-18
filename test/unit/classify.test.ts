@@ -319,6 +319,116 @@ describe("unit/classify: sqlite fields", () => {
 	}
 });
 
+/** A Durable Object's SQLite error, as workerd throws one: a plain Error, a message only. */
+function workerdError(message: string): Error {
+	return new Error(message);
+}
+
+describe("unit/classify: sqlite errors read from the message (Durable Objects)", () => {
+	// F11's five messages, character for character (workerd 1.20260730.1), and what the
+	// classifier reads from each: the code names pick kind and code, the subject is read
+	// once the tail is stripped. The rest are the same paths through other code names.
+	const cases: [string, string, SqlErrorInfo][] = [
+		[
+			"unique (F11)",
+			"UNIQUE constraint failed: child.code: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)",
+			{ kind: "unique", code: "2067", table: "child", columns: ["code"] },
+		],
+		[
+			"foreign key (F11)",
+			"FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)",
+			{ kind: "foreign_key", code: "787" },
+		],
+		[
+			"not null (F11)",
+			"NOT NULL constraint failed: child.name: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_NOTNULL)",
+			{ kind: "not_null", code: "1299", table: "child", columns: ["name"] },
+		],
+		[
+			"check (F11)",
+			"CHECK constraint failed: qty_positive: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_CHECK)",
+			{ kind: "check", code: "275", constraint: "qty_positive" },
+		],
+		[
+			"syntax (F11): a primary name alone",
+			'near "selec": syntax error at offset 0: SQLITE_ERROR',
+			{ kind: "unknown", code: "1" },
+		],
+		[
+			"a primary key",
+			"UNIQUE constraint failed: item.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)",
+			{ kind: "unique", code: "1555", table: "item", columns: ["id"] },
+		],
+		[
+			"an expression index",
+			"UNIQUE constraint failed: index 'item_email_lower': SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)",
+			{ kind: "unique", code: "2067", constraint: "item_email_lower" },
+		],
+		[
+			"an unnamed check: its expression is no constraint",
+			"CHECK constraint failed: n > 0: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_CHECK)",
+			{ kind: "check", code: "275" },
+		],
+		[
+			"a missing table",
+			"no such table: nope: SQLITE_ERROR",
+			{ kind: "unknown", code: "1" },
+		],
+		[
+			"a statement workerd does not authorize",
+			"not authorized: SQLITE_AUTH",
+			{ kind: "unknown", code: "23" },
+		],
+		[
+			"a primary code with a kind of its own",
+			"database is locked: SQLITE_BUSY",
+			{ kind: "busy", code: "5" },
+		],
+		[
+			"an extended name not in the table: the primary's kind, no code",
+			"database is locked: SQLITE_BUSY (extended: SQLITE_BUSY_SOMETHING_NEW)",
+			{ kind: "busy" },
+		],
+		[
+			"a name SQLite does not have: unknown, no code",
+			"something: SQLITE_NO_SUCH_CODE",
+			{ kind: "unknown" },
+		],
+	];
+	for (const [name, message, expected] of cases) {
+		test(name, () => {
+			assert.deepEqual(classifySqlite(workerdError(message)), expected);
+		});
+	}
+
+	test("the names are read only as a message's tail", () => {
+		for (const message of [
+			"SQLITE_CONSTRAINT_UNIQUE",
+			"UNIQUE constraint failed: t.c: SQLITE_CONSTRAINT_UNIQUE and more",
+			"UNIQUE constraint failed: t.c (extended: SQLITE_CONSTRAINT_UNIQUE)",
+			"failed: sqlite_constraint",
+		]) {
+			assert.deepEqual(classifySqlite(workerdError(message)), { kind: "unknown" });
+		}
+	});
+
+	test("a numeric errcode wins over the message", () => {
+		const error = Object.assign(
+			new Error("UNIQUE constraint failed: t.c: SQLITE_CONSTRAINT_CHECK"),
+			{ errcode: 2067 },
+		);
+		assert.equal(classifySqlite(error).kind, "unique");
+		assert.equal(classifySqlite(error).code, "2067");
+	});
+
+	test("the Postgres classifier does not read the SQLite tail", () => {
+		const error = workerdError(
+			"UNIQUE constraint failed: t.c: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)",
+		);
+		assert.deepEqual(classifyPg(error), { kind: "unknown" });
+	});
+});
+
 describe("unit/classify: what is not a driver error", () => {
 	test("a non-object is unknown to both", () => {
 		for (const value of [undefined, null, "boom", 42, true, Symbol("s"), 10n]) {

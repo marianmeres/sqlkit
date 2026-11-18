@@ -34,7 +34,8 @@ host code ── sql`…`, builders, decoders, withRetry, checkHealth
    │      ▲ SingleConnectionBackend (+ SyncBackend where the engine is synchronous)
    │      ├── "./sqlite"  src/sqlite/mod.ts   node:sqlite (has SyncBackend)
    │      ├── "./pg"      src/pg/client.ts    one pg.Client
-   │      └── "./pglite"  src/pglite/mod.ts   PGlite
+   │      ├── "./pglite"  src/pglite/mod.ts   PGlite
+   │      └── "./do"      src/do/mod.ts       Durable Objects storage (has SyncBackend)
    │
    └── "./migrate" src/migrate/mod.ts ── @marianmeres/migrate hooks over any Driver
        "./migrate/files" src/migrate/files.ts ── SQL files as versions (node:fs)
@@ -72,11 +73,12 @@ query(statement | text, params?)
 | `src/pg/lock.ts`         | the polled advisory lock both Postgres drivers take                          |
 | `src/pg/session.ts`      | what the two Postgres drivers share: read-only `BEGIN`, `COMMIT` check       |
 | `src/pg/types.ts`        | the structural node-postgres shapes                                          |
+| `src/do/mod.ts`          | `createDoDriver`: a Durable Object's storage as a backend, both tiers        |
 
 ## The Single-Connection Rule
 
-Lives in `src/single/driver.ts`, written once. node:sqlite, one `pg.Client` and PGlite are
-backends under it; a backend only runs what it is handed.
+Lives in `src/single/driver.ts`, written once. node:sqlite, one `pg.Client`, PGlite and a
+Durable Object's storage are backends under it; a backend only runs what it is handed.
 
 - Everything takes its turn on the one connection.
 - A statement runs inside the open transaction only when that transaction's own callback
@@ -103,19 +105,21 @@ outside runs on another connection at once.
 
 ## Adapters
 
-| Entry      | Factory                                               | `adapter`       | Dialect  | Shape             | `sync` | `concurrentWriters` | `crossProcessLock` |
-| ---------- | ----------------------------------------------------- | --------------- | -------- | ----------------- | ------ | ------------------- | ------------------ |
-| `./sqlite` | `createSqliteDriver(db)`, `openSqlite(path, options)` | `"node:sqlite"` | `sqlite` | single connection | true   | false               | false              |
-| `./pg`     | `createPgDriver(pool, options)`                       | `"pg"`          | `pg`     | pool              | false  | true                | true               |
-| `./pg`     | `createPgClientDriver(client, options)`               | `"pg-client"`   | `pg`     | single connection | false  | false               | true               |
-| `./pglite` | `createPgliteDriver(db)`                              | `"pglite"`      | `pg`     | single connection | false  | false               | false              |
+| Entry      | Factory                                               | `adapter`           | Dialect  | Shape             | `sync` | `concurrentWriters` | `crossProcessLock` |
+| ---------- | ----------------------------------------------------- | ------------------- | -------- | ----------------- | ------ | ------------------- | ------------------ |
+| `./sqlite` | `createSqliteDriver(db)`, `openSqlite(path, options)` | `"node:sqlite"`     | `sqlite` | single connection | true   | false               | false              |
+| `./pg`     | `createPgDriver(pool, options)`                       | `"pg"`              | `pg`     | pool              | false  | true                | true               |
+| `./pg`     | `createPgClientDriver(client, options)`               | `"pg-client"`       | `pg`     | single connection | false  | false               | true               |
+| `./pglite` | `createPgliteDriver(db)`                              | `"pglite"`          | `pg`     | single connection | false  | false               | false              |
+| `./do`     | `createDoDriver(storage)`                             | `"durable-objects"` | `sqlite` | single connection | true   | false               | false              |
 
 - **The host builds the client.** No adapter imports its driver library, not even its
   types: each declares the shape it takes structurally (`PgPoolLike`,
-  `PgStandaloneClientLike`, `PgliteLike`). node:sqlite is built into Node. The package
-  has no peer dependency.
+  `PgStandaloneClientLike`, `PgliteLike`, `DoStorageLike`). node:sqlite is built into
+  Node. The package has no peer dependency.
 - **`close()`** ends the client the adapter was given, and is idempotent. A host that keeps
-  its client does not call it.
+  its client does not call it. On Durable Objects it ends the driver only: the storage is
+  the object's.
 - **node:sqlite**: a transaction is `BEGIN IMMEDIATE`; a read-only one a deferred `BEGIN`
   with `query_only` on. `createSqliteDriver` sets nothing on the handle; `openSqlite` sets
   a busy timeout (5000 ms) and WAL for a file.
@@ -130,19 +134,46 @@ outside runs on another connection at once.
 
 ### Durable Objects
 
-No adapter yet (`./do` is not built). What the design rests on was checked in real
-workerd: `test/do/_workerd.ts` starts workerd through Miniflare from `node:test`, and
-`test/do/probe.test.ts` pins each assumption and probe. Findings, with the workerd version
-each was observed on: [DO-FINDINGS.md](./plans/v0-foundation/DO-FINDINGS.md). The
-single-connection core needs `AsyncLocalStorage` there, so the harness runs workerd with
-the `nodejs_compat` compatibility flag, and a host of the adapter will need it too.
+`src/do/mod.ts`, `createDoDriver(ctx.storage)`: a backend of the single-connection core
+over a SQLite-backed Durable Object's storage, with a `SyncBackend` too, since `sql.exec`
+is synchronous. It needs the `nodejs_compat` compatibility flag, for `AsyncLocalStorage`
+(D24). Everything it does differently was observed in real workerd first: findings
+F01–F15 in [DO-FINDINGS.md](./plans/v0-foundation/DO-FINDINGS.md), each pinned by
+`test/do/probe.test.ts`, with the workerd version it was observed on.
+
+- **Transactions** are `storage.transaction` (async tier) and `storage.transactionSync`
+  (sync tier): workerd refuses every transaction statement through `sql.exec` (F04).
+- **An open async transaction holds the whole object** (F14): no other request runs until
+  it settles. An async transaction must not await external I/O.
+- **Read-only by detection** (F12, D34.7): `query_only` is not authorized. Inside a
+  read-only transaction a statement that wrote (`rowsWritten` of the text's last
+  statement, or a move of `total_changes()`) throws a `ReadOnlyError` with code `8`, and
+  the transaction throws it again after the callback, inside the storage transaction, so
+  the write rolls back. DDL that is not a text's last statement goes unseen.
+- **R11 is not enforced** (F01): `sql.exec` runs every statement of a text given no values.
+- **A deferred constraint resets the object** (F15): workerd checks it when the request's
+  implicit transaction commits, not when `transaction()` ends.
+- **Values and rows** (F09, F10): a `bigint` binds as a number in the safe-integer range
+  and is a `TypeError` beyond; a blob's `ArrayBuffer` is handed on as a `Uint8Array`;
+  `rowCount` of a plain write is `changes()`, read right after it.
+- **Errors** (F11) carry no code; `classifySqlite` reads the code names at the end of the
+  message.
+
+The conformance bodies run inside workerd: `test/do/worker/conformance.ts` is a Durable
+Object that holds every body and runs one case per request, on a fresh object, and
+`test/do/conformance.test.ts` registers each as a `node:test` case under `describe("do")`.
+That worker is the `do` adapter's registry entry. A case that cannot hold there is listed
+under its `except`, with the finding as the reason, and reported as skipped with it: R11
+(F01) and the two deferred-constraint cases of the `errors` body (F15).
+`test/do/adapter.test.ts` holds what only this adapter does.
 
 ## The Two Tiers
 
-`driver.sync` exists where the engine is synchronous (node:sqlite today). Its transaction
-callback is synchronous: an async callback returns at its first `await`. The tiers share
-one connection, so each refuses what would land in the wrong transaction. The rules, as
-`src/core/contract.ts` states them and `test/conformance/sync.ts` holds every adapter to:
+`driver.sync` exists where the engine is synchronous (node:sqlite, Durable Objects). Its
+transaction callback is synchronous: an async callback returns at its first `await`. The
+tiers share one connection, so each refuses what would land in the wrong transaction. The
+rules, as `src/core/contract.ts` states them and `test/conformance/sync.ts` holds every
+adapter to:
 
 | Rule | Behaviour                                                                                                                          |
 | ---- | ---------------------------------------------------------------------------------------------------------------------------------- |
@@ -172,7 +203,7 @@ per rule, named `R<n>: …`.
 | R8   | `exclusive` serializes callers of one name, is re-entrant, lets two names run together, releases on rejection, and inside an open transaction belongs to that transaction. |
 | R9   | `exec` runs every statement of a script and joins the open transaction.                                                                                                    |
 | R10  | Parameters follow the one parameter rule. Rows are plain objects. Bytes read back as a `Uint8Array`.                                                                       |
-| R11  | `query` runs one statement: a text holding more is refused before any of it runs. A script goes through `exec`.                                                            |
+| R11  | `query` runs one statement: a text holding more is refused before any of it runs. A script goes through `exec`. Not on Durable Objects (F01).                              |
 
 A non-write's `rowCount` (DDL, a `SET`, a pragma) is a number and nothing more.
 
@@ -196,7 +227,7 @@ A non-write's `rowCount` (DDL, a `SET`, a pragma) is a number and nothing more.
 `createMigrate(db, options)` (`src/migrate/mod.ts`) is a `@marianmeres/migrate` instance
 whose hooks are the driver's:
 
-| Hook       | `crossProcessLock` true (pg, pg-client)   | otherwise (node:sqlite, PGlite)        |
+| Hook       | `crossProcessLock` true (pg, pg-client)   | otherwise (node:sqlite, PGlite, DO)    |
 | ---------- | ----------------------------------------- | -------------------------------------- |
 | `wrapRun`  | `db.exclusive("migrate:<table>", run)`    | `db.transaction(run)`                  |
 | `wrapStep` | `db.transaction(run)`, committed per step | `db.transaction(run)`, joining the run |

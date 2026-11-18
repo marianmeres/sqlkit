@@ -2,7 +2,8 @@
 
 What a SQLite-backed Durable Object does with the calls the design relies on, observed in
 real workerd. Source: [02](./02-adapters.md) #1. One entry per assumption (F01–F06 for
-A1–A6) and per probe (F07–F14 for P1–P8).
+A1–A6) and per probe (F07–F14 for P1–P8). F15 (P9) was added at T19, by the adapter row,
+on the same workerd; so were the notes marked "T19" under F10.
 
 **Observed on** workerd `1.20260730.1`, through Miniflare `4.20260730.0`, compatibility date
 `2026-07-01`, compatibility flags `nodejs_compat` only, Node 26.13.1, macOS arm64, on
@@ -173,6 +174,23 @@ a statement that returns none, which is safe because nothing can run between two
 synchronous calls. `changes()` is only meaningful after a write: a `select` or DDL leaves
 it unchanged.
 
+**T19, for read-only by detection (D34.7.1).** A read reports `rowsWritten` 0, the ones
+that use a temporary b-tree too: over 200 rows of an unindexed table, a plain `select`,
+`order by` an unindexed column (with and without `limit`), `group by` (with and without
+`order by` the count), `distinct`, `union`, a window function and a materialized CTE all
+reported 0. `select total_changes()` and `select changes()` report 0 as well. Pinned by
+`test/do/adapter.test.ts` (a read-only transaction running each is not refused).
+
+**T19: a text of several statements reports its last statement only.** `insert …; select
+1` reported `rowsWritten` 0 and `columnNames` `["1"]`, and the insert had run; `insert …
+(two rows); insert … (one row)` reported 1. `total_changes()` counts every row an
+`INSERT`, `UPDATE` or `DELETE` changed, whichever statement of a text it was, and not DDL
+(`create table u (v); select 1` left it unchanged). It is authorized; `PRAGMA
+schema_version` and `PRAGMA user_version` are not (`not authorized: SQLITE_AUTH`). So the
+adapter's detection reads both counters, and DDL that is not a text's last statement is
+the one write it cannot see. Pinned by `test/do/adapter.test.ts` (a write before the last
+statement is refused).
+
 ### F11 — P5: what does a constraint violation's error carry?
 
 **A plain `Error` with a message and nothing else**: `name` `"Error"`, constructor `Error`,
@@ -233,7 +251,10 @@ anyway), and the statement builders' `upsert` and `RETURNING` are usable here.
 Request B, sent to the same object 200 ms after A, ran only after A's transaction had
 finished: it saw no rows (A's row was rolled back), and its own insert survived A's
 rollback, so it was not inside A's transaction. A's view after the timer held only its
-own row. The responses came back A first, then B.
+own row. The responses came back A first, then B. (T19: not always. Once A's transaction
+has ended both responses are released, and under the load of the whole suite B's reached
+Node first in one run of five; B had still run only after A finished, which is what the
+probe pins.)
 
 The control, the same two requests with A's timer outside any transaction, interleaved: B
 ran while A awaited the timer, saw A's row, and A saw B's row after the timer.
@@ -244,3 +265,27 @@ during the transaction by the same request from outside the transaction's callba
 promise started before it); that is the case the core's queue and context (R5, D09) exist
 for, and they apply here unchanged. The cost the adapter's docs must state (02 #7) is
 confirmed: an async transaction that awaits anything holds the whole object for that long.
+
+### F15 — P9: when is a deferred foreign key checked? (added at T19)
+
+**When the request's implicit transaction commits, not when `transactionSync` or
+`transaction` ends, and a violation resets the object.** A child row whose
+`deferrable initially deferred` reference names no parent, written inside
+`transactionSync`, inside `transaction`, or with no transaction at all: the closure
+returned, the handler returned, and only then did the request fail, with HTTP 500 and no
+JSON envelope (nothing threw where the handler could catch it). For `transactionSync` and
+for no transaction the response was:
+
+> Durable Object was reset and rolled back to its last known good state because the
+> application left the database in a state where constraints were violated: FOREIGN KEY
+> constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)
+
+For `transaction` it was an opaque `internal error; reference = …`. In every mode a later
+request found the object as it was before the failing one: no orphan, and the parent row
+the setup request wrote still there. A violation that the same request repairs before it
+ends (the parent inserted after the transaction) commits without complaint.
+
+Consequence: the `errors` body's two cases of a constraint that `COMMIT` checks cannot hold
+here: there is no rejection to type, and the failing request takes its object down with
+it. They are listed under the `do` adapter's `except` with this entry as the reason. The
+adapter's docs tell a host to keep foreign keys immediate on Durable Objects.

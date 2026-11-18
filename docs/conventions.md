@@ -15,7 +15,7 @@
   | `test/unit/`                               | no database: pure functions, stub backends, the guards           |
   | `test/conformance/`                        | the bodies, their `*.test.ts` binders, the harness, the registry |
   | `test/pg/`, `test/pglite/`, `test/sqlite/` | one adapter's own suites and its `_fixture.ts`                   |
-  | `test/do/`                                 | the workerd harness and the Durable Objects probe                |
+  | `test/do/`                                 | the workerd harness, the probe, the `do` adapter's suites        |
 
 - A file whose name starts with `_` is a helper, not a test (`test/_env.ts`,
   `test/conformance/_suite.ts`).
@@ -24,11 +24,12 @@
 
 - Factories: `create<Name>Driver`; `openSqlite` is the one convenience that opens a client.
 - Structural client shapes: `<Name>Like` (`PgPoolLike`, `PgliteLike`).
-- `Driver.adapter`: `"node:sqlite"`, `"pg"`, `"pg-client"`, `"pglite"`.
+- `Driver.adapter`: `"node:sqlite"`, `"pg"`, `"pg-client"`, `"pglite"`, `"durable-objects"`.
 - Suites: a conformance body's cases run under `describe(<adapter name>)` and start with
   their rule (`R7: …`, `S4: …`, `errors: …`, `builders: …`). An adapter's own suite is
   `<adapter>/<topic>` (`pg/exclusive`); a unit suite `unit/<topic>`. The `test:pg`,
-  `test:pglite` and `test:sqlite` scripts select by these names.
+  `test:pglite` and `test:sqlite` scripts select by these names; `test:do` runs
+  `test/do/`.
 
 ## SQL
 
@@ -135,6 +136,10 @@ if (error.code === "23505" || /UNIQUE constraint failed/.test(error.message)) �
   (`db.dialect === "pg"`).
 - An adapter-specific test lives in `test/<adapter>/`, and its header says why it cannot be
   a conformance case.
+- A case that cannot hold on an adapter for a recorded reason about its database is listed
+  under the registry entry's `except`, with that reason, and reported as skipped with it,
+  never dropped. Only Durable Objects has any (`test/do/worker/conformance.ts`), each a
+  finding of `DO-FINDINGS.md` pinned by `test/do/probe.test.ts`.
 - Every case creates and disposes a database of its own: a fresh in-memory SQLite or PGlite,
   a fresh Postgres schema (`sqlkit_t_<random>`) dropped afterwards.
 - Postgres is read from `TEST_PG_*` (`test/_env.ts`). Missing, it fails the suite; nothing

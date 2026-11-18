@@ -31,4 +31,12 @@ export interface AdapterCase {
 	readonly sync: boolean;
 	/** A database isolated from every other case: each case creates and disposes one. */
 	create(): Promise<Fixture>;
+	/**
+	 * Cases that cannot hold on this adapter, by case name, each with its reason: a
+	 * recorded finding about the database (`F01: …`), never "it fails". The runner does not
+	 * run one; it reports it as an exception with that reason, and fails when an entry
+	 * names no case of any body. Only the `do` entry has any
+	 * (`test/do/worker/conformance.ts`); a case of another adapter is never excepted.
+	 */
+	readonly except?: Readonly<Record<string, string>>;
 }
