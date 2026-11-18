@@ -66,13 +66,16 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
 | ✅ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
 | ✅ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 D34 D40 | — |
-| ⬜ | T20 | T19 | Archive this plan set; copy the backlog to `docs/backlog.md` | [04](./04-scaffold-docs-release.md) #4 | D22 | — |
+| ✅ | T20 | T19 | Archive this plan set; copy the backlog to `docs/backlog.md` | [04](./04-scaffold-docs-release.md) #4 | D22 | — |
 
 Row order is run order. T19 comes after the docs rows on purpose: if it blocks, the
 package is documented and releasable without `./do`. T33 comes before them, so they
 document it. The release is not a row (D22).
 
 ## Backlog (ranked, not scheduled)
+
+> Archived by T20 as it stood then. The open copy is [`docs/backlog.md`](../../../backlog.md);
+> change that one.
 
 | Status | ID  | Rank | Task | Source |
 | ------ | --- | ---- | ---- | ------ |

@@ -4,8 +4,9 @@
 // single-connection core is wrong for Durable Objects, not that the test needs adjusting.
 // Probes P1–P8 are questions: each answer is printed as a diagnostic and pinned, so a
 // workerd upgrade that changes one fails here first. Every answer is written up, with the
-// workerd version it was observed on, in `docs/plans/v0-foundation/DO-FINDINGS.md`
-// (F01–F06 for the assumptions, F07–F14 for the probes); change the two together.
+// workerd version it was observed on, in the archived plan set's DO-FINDINGS.md,
+// `docs/_archive/plans/v0-foundation/DO-FINDINGS.md` (F01–F06 for the assumptions,
+// F07–F14 for the probes); change the two together.
 //
 // This file is adapter-specific by nature: it asks the runtime, not an adapter, so it has
 // no conformance body.

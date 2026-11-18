@@ -56,7 +56,7 @@ code was changed.
 
 ## Where this plan departs from the brief
 
-The brief is [`docs/sqlkit-brief.md`](../../sqlkit-brief.md). Each departure is a decision
+The brief is [`docs/sqlkit-brief.md`](../../../sqlkit-brief.md). Each departure is a decision
 in the tracker.
 
 | The brief says | The plan does | Why |

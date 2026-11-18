@@ -3,7 +3,7 @@
 The plan that builds sqlkit from an empty repository to a documented, releasable 0.1.0: the
 `sql` fragment builder, the driver contract with its sync tier, five adapters, typed
 errors, and the conventions layer. Produced on 2026-11-18 from the project brief
-([`docs/sqlkit-brief.md`](../../sqlkit-brief.md)), a review of the existing SQL code in the
+([`docs/sqlkit-brief.md`](../../../sqlkit-brief.md)), a review of the existing SQL code in the
 ecosystem, and a two-round interview with the owner. It is a planning artifact: no code was
 changed, and its technical claims were checked against the prior-art snapshot in
 `tmp/prior-art/` (gitignored; its README lists sources and commits).

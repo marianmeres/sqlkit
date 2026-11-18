@@ -72,7 +72,8 @@ an ORM, not a query builder. An app commits to one dialect.
       (`test/unit/exports.test.ts`).
 
 Source comments cite decisions as `Dnn` and plan sections as "plan doc NN #n": both are in
-the plan set under `docs/plans/v0-foundation/`.
+the v0 plan set, archived under `docs/_archive/plans/v0-foundation/`. What is still open
+from it is in `docs/backlog.md`.
 
 ## Documentation Index
 
@@ -85,5 +86,6 @@ the plan set under `docs/plans/v0-foundation/`.
   public-clean
 - [Tasks](./docs/tasks.md): add an adapter, an error kind, a conformance body
 - [Brief](./docs/sqlkit-brief.md): the original goal and non-goals
-- [Plan tracker](./docs/plans/v0-foundation/PROGRESS.md): the v0 sprint and its
-  decisions log
+- [Backlog](./docs/backlog.md): the work after v0, ranked, not scheduled
+- [v0 plan (archived)](./docs/_archive/plans/v0-foundation/PROGRESS.md): the v0 sprint,
+  its decisions log, and the Durable Objects findings beside it

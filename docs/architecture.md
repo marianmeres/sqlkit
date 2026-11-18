@@ -138,7 +138,7 @@ outside runs on another connection at once.
 over a SQLite-backed Durable Object's storage, with a `SyncBackend` too, since `sql.exec`
 is synchronous. It needs the `nodejs_compat` compatibility flag, for `AsyncLocalStorage`
 (D24). Everything it does differently was observed in real workerd first: findings
-F01–F15 in [DO-FINDINGS.md](./plans/v0-foundation/DO-FINDINGS.md), each pinned by
+F01–F15 in [DO-FINDINGS.md](./_archive/plans/v0-foundation/DO-FINDINGS.md), each pinned by
 `test/do/probe.test.ts`, with the workerd version it was observed on.
 
 - **Transactions** are `storage.transaction` (async tier) and `storage.transactionSync`
