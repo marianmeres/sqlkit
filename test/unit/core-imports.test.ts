@@ -85,11 +85,18 @@ describe("unit/core-imports", () => {
 	test("the entry point does import the core: the scan reads its specifiers", () => {
 		// A scan that matched nothing would also report no offense; this one must see the
 		// re-export, which it flags once the file is pretended to sit outside the root.
+		// Every re-export is flagged, and only those: the list grows with the core.
 		const source = readFileSync(ENTRY, "utf8");
 		assert.deepEqual(offenses(ENTRY, source), []);
-		assert.deepEqual(offenses(join(ROOT, "elsewhere", "x", "mod.ts"), source), [
-			"./core/sql.ts: outside src/core/",
-		]);
+		const moved = offenses(join(ROOT, "elsewhere", "x", "mod.ts"), source);
+		assert.ok(moved.includes("./core/sql.ts: outside src/core/"), moved.join(", "));
+		assert.ok(
+			moved.includes("./core/errors.ts: outside src/core/"),
+			moved.join(", "),
+		);
+		for (const offense of moved) {
+			assert.match(offense, /^\.\/core\/[\w-]+\.ts: outside src\/core\/$/);
+		}
 	});
 
 	test("the checker flags each kind of offense", () => {

@@ -47,7 +47,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ------ | --- | ---- | ---- | ------ | --------- | ------ |
 | ✅ | T01 | — | Owner pre-flight: scaffold, `.claude/settings.json`, test database and `.env`, first commit on `master` | [04](./04-scaffold-docs-release.md) #1 | D02 D20 D21 | — |
 | ✅ | T02 | T01 | `sql` fragments: `sql`, `raw`, `bind`, `join`, `ident`, `json`, `render`; the core-imports guard | [01](./01-core.md) #1 | D02 D21 | — |
-| ⬜ | T03 | T02 | Contract types, the parameter rule, `SqlError` classes, the pg and sqlite classifiers | [01](./01-core.md) #2, #3 | D07 D10 D11 D14 D17 | — |
+| ✅ | T03 | T02 | Contract types, the parameter rule, `SqlError` classes, the pg and sqlite classifiers | [01](./01-core.md) #2, #3 | D07 D10 D11 D14 D17 | — |
 | ⬜ | T04 | T03 | Durable Objects spike: workerd harness under `node:test`, assumptions A1–A6, probes P1–P8, `DO-FINDINGS.md` | [02](./02-adapters.md) #1 | D03 D05 D20 D24 | — |
 | ⬜ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
 | ⬜ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
@@ -183,6 +183,25 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
   two copies of the package accept each other's fragments. Also from T02: a template chunk
   with an invalid escape (cooked `undefined`) is a `TypeError`, not dropped text. Open to
   veto at T12 ([01](./01-core.md) #1).
+- **D26** (2026-11-18, T03 session) — Found while writing the classifiers and the
+  parameter rule; open to veto at T12 ([01](./01-core.md) #2, #3).
+  1. Postgres names no constraint on a not-null violation: on 18.6 a `23502` carries
+     `table` and `column` only (unique, foreign-key and check violations carry
+     `constraint` and `table`). The field table in #3 is corrected; T08's errors body
+     expects no `constraint` on a pg `NotNullViolationError`.
+  2. The parameter rule's "plain object" is one whose prototype is `Object.prototype` or
+     `null`. Any other object (`Map`, `Set`, a class instance, a typed array other than
+     `Uint8Array`) is a `TypeError`, because `JSON.stringify` would turn a `Map` into
+     `{}`. An invalid `Date` and a fragment passed as a parameter are `TypeError`s on both
+     dialects. The rule is exported as `normalizeParam(value, dialect)` and
+     `normalizeParams(params, dialect)`; `statementOf` stays a pure render/pass-through
+     and the adapter applies the rule after it.
+  3. SQLite's subject is read from the message as well as the message allows: a dotted
+     table or column name is split at its first dot, and an unnamed `CHECK` whose whole
+     expression is one identifier (`check (active)`) reads as a constraint of that name,
+     since SQLite reports an unnamed check by its expression text.
+  4. `SqlError`'s constructor refuses an unknown `kind` or dialect with a `TypeError`;
+     each class's `name` is set on its prototype.
 
 ## How to resume (for a fresh conversation)
 

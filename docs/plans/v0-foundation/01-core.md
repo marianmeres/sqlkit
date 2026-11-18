@@ -288,7 +288,7 @@ README) and against node:sqlite on Node 26.13.1. Planning artifact; no code was 
 
   | Field | `pg` | `sqlite` |
   |-------|------|----------|
-  | `constraint` | always, for the four constraint kinds | only for a unique *expression* index (`index 'name'`) and a named `CHECK` |
+  | `constraint` | unique, foreign key and check; not not-null, which names none (Postgres 18.6, D26) | only for a unique *expression* index (`index 'name'`) and a named `CHECK` |
   | `table` | always | unique and not-null only |
   | `columns` | not-null only (`error.column`) | unique (column form) and not-null |
 
