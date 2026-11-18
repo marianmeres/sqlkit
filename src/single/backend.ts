@@ -53,7 +53,9 @@ export interface SingleConnectionBackend extends Connection {
 	 * themselves.
 	 *
 	 * The core calls it in the connection's turn, never twice at once, and never from
-	 * inside an open transaction: a nested `transaction` is joined by the core.
+	 * inside an open transaction: a nested `transaction` is joined by the core. On the
+	 * `pg` dialect `fn` itself rejects, with `TransactionAbortedError`, when a failed
+	 * statement aborted the transaction: the backend rolls back as for any rejection.
 	 */
 	transaction<T>(fn: (inner: Connection) => Promise<T>, readOnly: boolean): Promise<T>;
 	/**

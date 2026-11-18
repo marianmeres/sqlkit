@@ -1,10 +1,11 @@
-// A Postgres driver on a schema of its own (plan doc 02 #4, D20): what the `pg` entry of the
-// conformance registry creates for every case, and what the suites under `test/pg/` create
-// with a pool size of their choosing.
+// A Postgres driver on a schema of its own (plan doc 02 #4, #5, D20): what the `pg` and
+// `pg-client` entries of the conformance registry create for every case, and what the
+// suites under `test/pg/` create with a pool size of their choosing.
 //
 // The schema (`sqlkit_t_<random>`) is created by a bootstrap pool of one connection,
 // applied as the driver's `search_path` through the `schema` option, and dropped with
-// `CASCADE` by the same bootstrap pool once the driver's own pool has ended.
+// `CASCADE` by the same bootstrap pool once the driver's own pool, or its client, has
+// ended.
 //
 // Imports no `node:test`: the conformance registry imports it, and the bodies it serves are
 // runner-agnostic.
@@ -13,7 +14,7 @@ import { randomBytes } from "node:crypto";
 import pg from "pg";
 import type { Driver } from "../../src/mod.ts";
 import { quoteIdent } from "../../src/mod.ts";
-import { createPgDriver } from "../../src/pg/mod.ts";
+import { createPgClientDriver, createPgDriver } from "../../src/pg/mod.ts";
 import { testPgConfig } from "../_env.ts";
 
 export interface PgFixture {
@@ -42,14 +43,24 @@ function freshSchema(): string {
 	return `sqlkit_t_${randomBytes(6).toString("hex")}`;
 }
 
-/** A driver on a schema of its own, dropped with everything in it by `dispose()`. */
-export async function createPgFixture(
-	options: PgFixtureOptions = {},
+/**
+ * A fresh schema, and its disposal once `driver` is closed: the driver comes from
+ * `create`, which is handed the schema's name. A `create` that throws leaves no schema.
+ */
+export async function onFreshSchema(
+	create: (schema: string) => Promise<Driver>,
 ): Promise<PgFixture> {
 	const config = testPgConfig();
 	const schema = freshSchema();
 	const quoted = quoteIdent(schema);
 	const bootstrap = new pg.Pool({ ...config, max: 1 });
+	const drop = async (): Promise<void> => {
+		try {
+			await bootstrap.query(`drop schema ${quoted} cascade`);
+		} finally {
+			await bootstrap.end();
+		}
+	};
 	try {
 		await bootstrap.query(`create schema ${quoted}`);
 	} catch (error) {
@@ -64,9 +75,13 @@ export async function createPgFixture(
 				)
 			: error;
 	}
-	const driver = createPgDriver(new pg.Pool({ ...config, max: options.max ?? 4 }), {
-		schema,
-	});
+	let driver: Driver;
+	try {
+		driver = await create(schema);
+	} catch (error) {
+		await drop();
+		throw error;
+	}
 	return {
 		driver,
 		schema,
@@ -74,14 +89,38 @@ export async function createPgFixture(
 			try {
 				await driver.close();
 			} finally {
-				try {
-					await bootstrap.query(`drop schema ${quoted} cascade`);
-				} finally {
-					await bootstrap.end();
-				}
+				await drop();
 			}
 		},
 	};
+}
+
+/** A driver on a schema of its own, dropped with everything in it by `dispose()`. */
+export function createPgFixture(options: PgFixtureOptions = {}): Promise<PgFixture> {
+	return onFreshSchema(async (schema) =>
+		createPgDriver(new pg.Pool({ ...testPgConfig(), max: options.max ?? 4 }), {
+			schema,
+		}),
+	);
+}
+
+/**
+ * A driver over one connected `pg.Client` on a schema of its own, dropped with everything
+ * in it by `dispose()`, which ends the client through the driver's `close()`.
+ */
+export function createPgClientFixture(): Promise<PgFixture> {
+	return onFreshSchema(async (schema) => {
+		const client = await connectedClient();
+		return createPgClientDriver(client, { schema });
+	});
+}
+
+/** A `pg.Client` on the test database, connected; the caller ends it. */
+export async function connectedClient(): Promise<pg.Client> {
+	const client = new pg.Client(testPgConfig());
+	// A failed connect closes its own socket: there is nothing to end.
+	await client.connect();
+	return client;
 }
 
 /** A second driver on `schema`: another pool, as another process has. */

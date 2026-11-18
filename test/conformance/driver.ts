@@ -12,7 +12,13 @@
 // says so and asserts each side.
 
 import assert from "node:assert/strict";
-import { checkHealth, type Driver, SqlError, sql } from "../../src/mod.ts";
+import {
+	checkHealth,
+	type Driver,
+	SqlError,
+	sql,
+	TransactionAbortedError,
+} from "../../src/mod.ts";
 import type { AdapterCase, Suite } from "./_suite.ts";
 
 /** A promise and the function that resolves it: a gate a case opens by hand. */
@@ -235,7 +241,15 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 			assert.equal(await count(db, "kept"), 1);
 		} else {
 			// Postgres aborted the transaction: a COMMIT would be answered with ROLLBACK.
-			await assert.rejects(outcome);
+			// Every adapter says so the same way, whether it read the COMMIT's answer or
+			// never sent one.
+			await assert.rejects(
+				outcome,
+				(error) =>
+					error instanceof TransactionAbortedError &&
+					error.kind === "aborted" &&
+					error.dialect === "pg",
+			);
 			assert.equal(await count(db, "kept"), 0);
 		}
 	});

@@ -60,7 +60,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 D34 | — |
 | ✅ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
 | ✅ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 D36 | — |
-| ⬜ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
+| ✅ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
 | ⬜ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
 | ⬜ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
 | ⬜ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
@@ -529,6 +529,42 @@ D34 changes says so where it stands.
   6. `compareSemver`, `normalizeSemver` and `parseSemver` come from `@marianmeres/migrate`,
      which re-exports them: no new dependency. Any directory entry that is not a directory
      is considered, so a symbolic link to a file loads.
+
+- **D37** (2026-11-18, T15 session) — Found while putting one `pg.Client` under the
+  single-connection core; open to veto ([02](./02-adapters.md) #5).
+  1. The client's type is `PgStandaloneClientLike`, which extends `PgClientLike` with `end`
+     (D29.1) and with `on` and `listenerCount`: the driver listens to the client's `error`
+     event as the pool driver listens to its pool's, since node-postgres emits one when an
+     idle client's connection drops and an unlistened one ends the process. Quiet when the
+     host listens; a warning otherwise. A `pg.Pool` is refused with a `TypeError` (it has a
+     numeric `totalCount`): every statement of a "transaction" would take any connection.
+  2. The core's count is of the transaction's state, not of failures. A failure sets it
+     (the first of a run is the `cause`); a statement's success after one clears it, since
+     on Postgres only a `rollback to savepoint` can succeed in an aborted transaction; a
+     lock's success clears nothing (a backend may take one without a statement); a
+     `TypeError` counts for neither. Without the clearing, a transaction recovered through
+     a hand-written savepoint would be rolled back on `pg-client` and committed on the
+     pool.
+  3. Before deciding, the core waits for whatever the transaction's context sent and did
+     not await. Otherwise a failing statement still in flight when the callback resolved
+     is missed, and the `COMMIT` goes out.
+  4. The client backend still checks the `COMMIT`'s command tag, as the pool does: a
+     failure the core cannot see (the host's own statement on the same client) is
+     otherwise a commit reported with nothing kept. The core's `TransactionAbortedError`
+     carries the failure as `cause`; the tag's carries none (D30.3). R3's `pg` side in the
+     `driver` body now asserts `TransactionAbortedError` of kind `aborted` on every `pg`
+     adapter.
+  5. The client backend sends one statement at a time, in order: node-postgres deprecates
+     a second `query()` on a client still running one, which a callback's `Promise.all`
+     inside a transaction would otherwise do. `options.schema` is set before the first
+     statement, outside any transaction; a failed `set search_path` is tried again by the
+     next statement.
+  6. Shared with the pool driver, moved rather than copied: the lock to `src/pg/lock.ts`
+     (as 02 #5 says) and `BEGIN_READ_ONLY`, the `COMMIT` refusal, the result reading and
+     the `schema` option's check to `src/pg/session.ts`. The pool's messages are unchanged.
+  7. The savepoint and not-awaited cases live in `test/pg/client.test.ts`, not in the
+     `driver` body: a Durable Object refuses `SAVEPOINT` (F04), and the wait for statements
+     not awaited is the single-connection core's, which the pool does not have.
 
 ## How to resume (for a fresh conversation)
 

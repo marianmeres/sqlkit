@@ -7,7 +7,8 @@
 // a transaction's statements all land on one pinned connection and that the `schema`
 // option governs every checkout, have no counterpart on a single connection. Nor do the
 // last two: only Postgres aborts a transaction on a failed statement and then answers its
-// `COMMIT` with `ROLLBACK`, and only a pool emits `error` for an idle client.
+// `COMMIT` with `ROLLBACK`, and a pool emits `error` for an idle client of its own (the
+// client driver's counterpart is in `client.test.ts`).
 //
 // Suite names start with `pg/`: `pnpm run test:pg` selects them by it.
 

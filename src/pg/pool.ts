@@ -27,12 +27,8 @@
  * waits for that transaction rather than running inside it. Inside an open transaction it
  * takes the transaction-scoped lock on the pinned client.
  *
- * The lock is **polled** (`pg_try_advisory_lock`), never waited for in a statement. A
- * session blocked in `pg_advisory_lock` holds a snapshot, and `CREATE INDEX
- * CONCURRENTLY` in the session that holds the lock waits for every older snapshot to
- * end: the waiter and the holder wait for each other, and Postgres breaks the cycle by
- * killing one with `40P01`. Between polls the waiter holds no snapshot, so the build
- * finishes and the waiter takes its turn.
+ * The lock is **polled** (`pg_try_advisory_lock`), never waited for in a statement:
+ * `lock.ts`, shared with the client driver, says why.
  *
  * `transaction(fn, { readOnly: true })` begins `REPEATABLE READ READ ONLY`: one snapshot,
  * taken at its first statement, for all of them: what a dump reads its pages in.
@@ -61,7 +57,6 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { setTimeout as sleep } from "node:timers/promises";
 import { classifyPg } from "../core/classify-pg.ts";
 import {
 	assertLockName,
@@ -73,9 +68,17 @@ import {
 	statementOf,
 	type TransactionOptions,
 } from "../core/contract.ts";
-import { TransactionAbortedError, toSqlError } from "../core/errors.ts";
+import { toSqlError } from "../core/errors.ts";
 import { normalizeParams } from "../core/params.ts";
-import { quoteIdent, type Sql } from "../core/sql.ts";
+import type { Sql } from "../core/sql.ts";
+import { type LockKey, type LockStatement, lockKeyOf, takeLock, unlock } from "./lock.ts";
+import {
+	BEGIN_READ_ONLY,
+	describe,
+	notCommitted,
+	resultOf,
+	searchPathOf,
+} from "./session.ts";
 import type {
 	PgClientLike,
 	PgDriverOptions,
@@ -83,17 +86,6 @@ import type {
 	PgPoolLike,
 	PgQueryResultLike,
 } from "./types.ts";
-
-/**
- * How `transaction(fn, { readOnly: true })` begins: one snapshot for every statement, taken
- * at the first, and no write. `READ COMMITTED`, the default, takes one per statement.
- */
-const BEGIN_READ_ONLY = "begin isolation level repeatable read, read only";
-
-/** The first wait between two polls for an `exclusive` lock, in milliseconds. */
-const LOCK_POLL_FIRST_MS = 10;
-/** The longest wait between two polls: the doubling stops here. */
-const LOCK_POLL_MAX_MS = 250;
 
 /**
  * A pinned client and what it is pinned for: a transaction, or an `exclusive` section
@@ -112,24 +104,7 @@ interface Pin {
 	turn: Promise<unknown>;
 }
 
-/** The two `int4` keys of one advisory lock: the name's and the schema's. */
-type LockKey = readonly [number, number];
-
 const settled = (): undefined => undefined;
-
-/**
- * What a `COMMIT` that did not commit is refused with. The server sent no error, so there
- * is no `code` and no `cause`: only the command tag said so.
- */
-function notCommitted(command: string): TransactionAbortedError {
-	return new TransactionAbortedError(
-		`postgres answered COMMIT with ${command}: a statement inside the transaction ` +
-			"failed, so nothing was committed; the callback caught that statement's error " +
-			"and returned as if it had succeeded",
-		"pg",
-		{ kind: "aborted" },
-	);
-}
 
 /**
  * What node-postgres threw, as the contract has it: a `SqlError` of its kind, with the
@@ -178,7 +153,7 @@ function send(
  */
 export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Driver {
 	assertPool(pool);
-	const setSearchPath = searchPathOf(options);
+	const setSearchPath = searchPathOf(options, "createPgDriver", "pool");
 
 	// An idle client's error is emitted on the pool, and an `error` nobody listens to
 	// ends the process. Quiet when the host listens as well: the report is theirs.
@@ -229,22 +204,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		client: PgClientLike,
 		text: string,
 		values: unknown[],
-	): Promise<QueryResult<T>> => {
-		const result = await send(client, text, values);
-		// The extended protocol answers one result. Several mean a node-postgres that
-		// ignored `queryMode` and sent a simple query, which ran every statement.
-		if (Array.isArray(result)) {
-			throw new TypeError(
-				"query() runs one statement, and this text held several (each of them ran): " +
-					"a script goes through exec()",
-			);
-		}
-		return {
-			rows: result.rows as T[],
-			// `rowCount` is null for a statement that affects nothing countable.
-			rowCount: result.rowCount ?? result.rows.length,
-		};
-	};
+	): Promise<QueryResult<T>> => resultOf<T>(await send(client, text, values));
 
 	/**
 	 * The pin a statement issued here belongs to. An ended transaction is no transaction
@@ -402,45 +362,14 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		}
 	};
 
-	/** The lock's two keys, computed once so a later `search_path` cannot move them. */
-	const lockKeyOf = async (client: PgClientLike, name: string): Promise<LockKey> => {
-		const { rows } = await send(
-			client,
-			"select hashtext($1) as a, hashtext(coalesce(current_schema(), '')) as b",
-			[name],
-		);
-		const row = rows[0];
-		if (row === undefined) throw new Error("postgres: hashtext() answered no row");
-		return [Number(row.a), Number(row.b)];
-	};
-
-	/**
-	 * Poll until the lock is taken: `pg_try_advisory_lock` (session) or
-	 * `pg_try_advisory_xact_lock` (to the end of the open transaction). Never a blocking
-	 * `pg_advisory_lock`: see the header for the deadlock that would be.
-	 */
-	const takeLock = async (
-		client: PgClientLike,
-		key: LockKey,
-		scope: "session" | "transaction",
-		turn: <T>(work: () => Promise<T>) => Promise<T>,
-	): Promise<void> => {
-		const fn =
-			scope === "session" ? "pg_try_advisory_lock" : "pg_try_advisory_xact_lock";
-		let wait = LOCK_POLL_FIRST_MS;
-		for (;;) {
-			const { rows } = await turn(() =>
-				send(client, `select ${fn}($1, $2) as ok`, [...key]),
-			);
-			if (rows[0]?.ok === true) return;
-			await sleep(wait);
-			wait = Math.min(wait * 2, LOCK_POLL_MAX_MS);
-		}
-	};
-
-	const unlock = async (client: PgClientLike, key: LockKey): Promise<void> => {
-		await send(client, "select pg_advisory_unlock($1, $2)", [...key]);
-	};
+	/** Lock statements on `client`, each guarded, and each in its turn when one is given. */
+	const lockStatement =
+		(
+			client: PgClientLike,
+			turn: <R>(work: () => Promise<R>) => Promise<R> = (work) => work(),
+		): LockStatement =>
+		(text, values) =>
+			turn(() => send(client, text, values));
 
 	const exclusive = async <T>(
 		name: string,
@@ -456,8 +385,9 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		// release a transaction-scoped lock any earlier.
 		if (pin?.kind === "transaction") {
 			const tx = pin;
-			const key = await lockKeyOf(tx.client, name);
-			await takeLock(tx.client, key, "transaction", (work) => work());
+			const statement = lockStatement(tx.client);
+			const key = await lockKeyOf(statement, name);
+			await takeLock(statement, key, "transaction");
 			tx.held.add(name);
 			return fn(driver);
 		}
@@ -465,15 +395,17 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		// Another name inside a section: on the section's own client, which holds both.
 		if (pin !== undefined) {
 			const section = pin;
-			const turn = <R>(work: () => Promise<R>): Promise<R> => onTurn(section, work);
-			const key = await turn(() => lockKeyOf(section.client, name));
-			await takeLock(section.client, key, "session", turn);
+			const statement = lockStatement(section.client, (work) =>
+				onTurn(section, work),
+			);
+			const key = await lockKeyOf(statement, name);
+			await takeLock(statement, key, "session");
 			section.held.add(name);
 			try {
 				return await fn(driver);
 			} finally {
 				section.held.delete(name);
-				await turn(() => unlock(section.client, key));
+				await unlock(statement, key);
 			}
 		}
 
@@ -489,11 +421,12 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		// Set when the connection must be destroyed rather than reused: destroying it is
 		// also what releases a session lock that could not be released by statement.
 		let destroy: Error | undefined;
+		const statement = lockStatement(client);
 		try {
 			let key: LockKey;
 			try {
-				key = await lockKeyOf(client, name);
-				await takeLock(client, key, "session", (work) => work());
+				key = await lockKeyOf(statement, name);
+				await takeLock(statement, key, "session");
 			} catch (error) {
 				// Whether the lock was taken is unknown.
 				destroy = error as Error;
@@ -507,7 +440,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 				section.open = false;
 				await section.turn;
 				try {
-					await unlock(client, key);
+					await unlock(statement, key);
 				} catch (error) {
 					destroy = error as Error;
 				}
@@ -560,35 +493,9 @@ function assertPool(pool: unknown): asserts pool is PgPoolLike {
 	}
 }
 
-/** The `set search_path` statement `options.schema` asks for, or none. */
-function searchPathOf(options: PgDriverOptions | undefined): string | undefined {
-	if (options === undefined) return undefined;
-	if (typeof options !== "object" || options === null) {
-		throw new TypeError(
-			`createPgDriver(pool, options) takes an object, got ${describe(options)}`,
-		);
-	}
-	const schema: unknown = options.schema;
-	if (schema === undefined) return undefined;
-	if (typeof schema !== "string" || schema === "") {
-		throw new TypeError(
-			`createPgDriver: schema is a non-empty string, got ${describe(schema)}`,
-		);
-	}
-	return `set search_path to ${quoteIdent(schema)}`;
-}
-
 /** A callback, refused before anything starts when it is not a function. */
 function assertCallback(fn: unknown, call: string): void {
 	if (typeof fn !== "function") {
 		throw new TypeError(`${call} takes a function, got ${describe(fn)}`);
 	}
-}
-
-/** A short, safe description of a value for an error message. */
-function describe(value: unknown): string {
-	if (value === null) return "null";
-	if (Array.isArray(value)) return "an array";
-	if (typeof value === "string") return value === "" ? "an empty string" : "a string";
-	return typeof value === "object" ? "an object" : `a ${typeof value}`;
 }

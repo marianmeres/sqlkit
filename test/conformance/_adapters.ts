@@ -12,7 +12,7 @@
 // `before` has resolved, so a file that starts a server there would leave it running.
 
 import { openSqlite } from "../../src/sqlite/mod.ts";
-import { createPgFixture } from "../pg/_fixture.ts";
+import { createPgClientFixture, createPgFixture } from "../pg/_fixture.ts";
 import type { AdapterCase, Fixture } from "./_suite.ts";
 
 export const ADAPTERS: readonly AdapterCase[] = [
@@ -31,5 +31,13 @@ export const ADAPTERS: readonly AdapterCase[] = [
 		name: "pg",
 		sync: false,
 		create: (): Promise<Fixture> => createPgFixture(),
+	},
+	{
+		// One connected `pg.Client` on a fresh schema per case, dropped the same way: the
+		// single-connection core over Postgres. Its name starts with `pg`, so
+		// `pnpm run test:pg` selects it too.
+		name: "pg-client",
+		sync: false,
+		create: (): Promise<Fixture> => createPgClientFixture(),
 	},
 ];

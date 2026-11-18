@@ -1,9 +1,9 @@
 // The single-connection core against a stub backend (plan doc 02 #2): the parts of the
-// seam no registered adapter exercises yet. node:sqlite hands its transaction callback
-// itself and has no lock other processes honour; a backend whose library hands out a
-// transaction object, and one with a lock, arrive with later adapters. The routing and the
-// lock calls are the core's, so they are pinned here, on a backend that records what it
-// was asked. No database.
+// seam no registered adapter exercises yet. node:sqlite and the `pg.Client` backend hand
+// their transaction callback themselves, and only the client has a lock other processes
+// honour; a backend whose library hands out a transaction object arrives with a later
+// adapter. The routing and the lock calls are the core's, so they are pinned here, on a
+// backend that records what it was asked. No database.
 //
 // The sync tier's routing is pinned here too (plan doc 02 #3), along with the one moment
 // of S4 no adapter can be timed into: after the async callback settled, before the
@@ -11,7 +11,13 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { BusyError, SqlError, type SqlErrorInfo } from "../../src/mod.ts";
+import {
+	BusyError,
+	type DialectName,
+	SqlError,
+	type SqlErrorInfo,
+	TransactionAbortedError,
+} from "../../src/mod.ts";
 import type {
 	Connection,
 	SingleConnectionBackend,
@@ -559,5 +565,163 @@ describe("unit/single-backend: typed errors", () => {
 			),
 			own,
 		);
+	});
+});
+
+// ── an aborted transaction (plan doc 02 #5) ─────────────────────────────────────────
+//
+// On `pg` the core refuses to commit a transaction a failed statement aborted. The client
+// driver's suite (test/pg/client.test.ts) shows it against Postgres: no COMMIT sent, a
+// statement the callback did not await waited for, a savepoint's recovery. What no real
+// failure reaches is pinned here: a backend's own `TypeError` is no failure, a lock's
+// failure is one, a lock's success recovers nothing, and SQLite is left alone.
+
+/**
+ * A backend of `dialect` that logs its transaction's end, and whose statements, lock and
+ * release fail as their text or name says: `fail…` with a driver's error, `refuse…` with
+ * a `TypeError` of the backend's own.
+ */
+function aborting(dialect: DialectName): Stub {
+	const log: string[] = [];
+	const outcome = (what: string): void => {
+		if (what.startsWith("fail")) throw driverError(what);
+		if (what.startsWith("refuse")) throw new TypeError(`refused ${what}`);
+	};
+	const backend: SingleConnectionBackend = {
+		dialect,
+		adapter: "stub",
+		async run(text) {
+			outcome(text);
+			return { rows: [], rowCount: 0 };
+		},
+		async exec(script) {
+			outcome(script);
+		},
+		async transaction(fn) {
+			try {
+				const result = await fn(backend);
+				log.push("commit");
+				return result;
+			} catch (error) {
+				log.push("rollback");
+				throw error;
+			}
+		},
+		async lock(name) {
+			outcome(name);
+			return async () => {
+				outcome(`${name} release`);
+			};
+		},
+		classify: classifyStub,
+		async close() {},
+	};
+	return { backend, log };
+}
+
+describe("unit/single-backend: an aborted transaction", () => {
+	test("pg: a swallowed failure rolls back with TransactionAbortedError, the failure its cause", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		let failed: unknown;
+		const error = await rejection(
+			"the transaction",
+			db.transaction(async (tx) => {
+				failed = await rejection("exec", tx.exec("fail script"));
+				return "swallowed";
+			}),
+		);
+		assert.ok(error instanceof TransactionAbortedError, String(error));
+		assert.equal(error.dialect, "pg");
+		assert.equal(error.kind, "aborted");
+		assert.ok(failed instanceof BusyError);
+		assert.equal(error.cause, failed);
+		assert.deepEqual(log, ["rollback"]);
+		// The next transaction starts with nothing counted against it.
+		assert.equal(await db.transaction(async () => "next"), "next");
+		assert.deepEqual(log, ["rollback", "commit"]);
+	});
+
+	test("pg: the first failure is the cause; a later statement's success clears it", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		let first: unknown;
+		const error = await rejection(
+			"the transaction",
+			db.transaction(async (tx) => {
+				first = await rejection("first", tx.query("fail 1"));
+				await rejection("second", tx.query("fail 2"));
+			}),
+		);
+		assert.equal((error as Error).cause, first);
+		assert.equal(
+			await db.transaction(async (tx) => {
+				await rejection("a failure", tx.query("fail"));
+				await tx.query("rollback to savepoint");
+				return "recovered";
+			}),
+			"recovered",
+		);
+		assert.deepEqual(log, ["rollback", "commit"]);
+	});
+
+	test("pg: a backend's TypeError is no failure; the callback's own error still wins", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		assert.equal(
+			await db.transaction(async (tx) => {
+				await assert.rejects(tx.query("refuse"), TypeError);
+				return "committed";
+			}),
+			"committed",
+		);
+		const own = new Error("the callback's own");
+		assert.equal(
+			await rejection(
+				"the transaction",
+				db.transaction(async (tx) => {
+					await rejection("a failure", tx.query("fail"));
+					throw own;
+				}),
+			),
+			own,
+		);
+		assert.deepEqual(log, ["commit", "rollback"]);
+	});
+
+	test("pg: a failed lock inside the transaction aborts it; a lock's success recovers nothing", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		await assert.rejects(
+			db.transaction(async (tx) => {
+				await rejection(
+					"the lock",
+					tx.exclusive("fail lock", async () => undefined),
+				);
+			}),
+			TransactionAbortedError,
+		);
+		await assert.rejects(
+			db.transaction(async (tx) => {
+				await rejection("a failure", tx.query("fail"));
+				// Taken and released, neither by a statement the server ran.
+				await tx.exclusive("job", async () => undefined);
+			}),
+			TransactionAbortedError,
+		);
+		assert.deepEqual(log, ["rollback", "rollback"]);
+	});
+
+	test("sqlite: a swallowed failure commits the rest, as SQLite does", async () => {
+		const { backend, log } = aborting("sqlite");
+		const db = createSingleConnectionDriver(backend);
+		assert.equal(
+			await db.transaction(async (tx) => {
+				await rejection("a failure", tx.query("fail"));
+				return "committed";
+			}),
+			"committed",
+		);
+		assert.deepEqual(log, ["commit"]);
 	});
 });

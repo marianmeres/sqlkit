@@ -22,6 +22,18 @@
  * A nested `transaction()` joins the open one, as it was opened. The backend is asked for
  * a transaction only at the top level, in the connection's turn.
  *
+ * **A transaction Postgres aborted is not committed.** On the `pg` dialect a failed
+ * statement aborts the whole transaction: every statement after it fails, and the `COMMIT`
+ * is answered with `ROLLBACK`, without an error. A callback that caught the failure and
+ * resolved anyway would be reported committed with nothing kept, so the core keeps count:
+ * once the callback resolved, and whatever it issued in the transaction and did not await
+ * has settled, a transaction whose last failure no later statement got past rejects with
+ * `TransactionAbortedError` (the failure is its `cause`), and the backend rolls back
+ * instead of committing. A statement that succeeds after a failure means the transaction
+ * was recovered (a `rollback to savepoint` is the one that can), so it clears the count.
+ * It is the one piece of dialect knowledge the core has: SQLite undoes the failed
+ * statement alone, and commits the rest.
+ *
  * `exclusive()` is an in-process queue per lock name and, where the backend has a lock
  * other processes honour (`backend.lock`), that lock too, taken once the queue lets a
  * caller through. Called inside an open transaction it does not queue: the transaction
@@ -79,7 +91,7 @@ import {
 	statementOf,
 	type TransactionOptions,
 } from "../core/contract.ts";
-import { toSqlError } from "../core/errors.ts";
+import { TransactionAbortedError, toSqlError } from "../core/errors.ts";
 import { normalizeParams } from "../core/params.ts";
 import type { Sql } from "../core/sql.ts";
 import type {
@@ -97,6 +109,13 @@ interface OpenTransaction {
 	open: boolean;
 	/** What the backend handed the transaction's callback: its statements go there. */
 	readonly connection: Connection;
+	/**
+	 * `pg` only: the failure that aborted the transaction, while no statement since has
+	 * succeeded.
+	 */
+	failure: Thrown | undefined;
+	/** `pg` only: what the transaction's context sent on its connection, until it settles. */
+	readonly pending: Set<Promise<unknown>>;
 }
 
 /**
@@ -158,6 +177,12 @@ export function createSingleConnectionDriver(
 	 */
 	const fromTransaction = (error: unknown, thrown: Thrown | undefined): unknown =>
 		thrown !== undefined && error === thrown.error ? error : wrap(error);
+
+	/**
+	 * Whether a failed statement aborts the whole transaction: Postgres's rule, which the
+	 * core tracks (see the header). SQLite undoes the failed statement alone.
+	 */
+	const abortsOnFailure = dialect === "pg";
 
 	const backendLock = backend.lock?.bind(backend);
 	/** The backend's lock, its taking and its release both guarded. */
@@ -222,6 +247,53 @@ export function createSingleConnectionDriver(
 		params: readonly unknown[],
 	): Promise<QueryResult<Row>> => guard(() => connection.run(text, params));
 
+	/**
+	 * `call`, sent on the open transaction `tx`. On `pg` its outcome is counted: a failure
+	 * aborted the transaction, and a statement's success after one recovered it. A lock's
+	 * success does not count, since a backend may take or release it without a statement.
+	 * A `TypeError` is a refusal, not the database's answer, and counts for neither.
+	 */
+	const inTransaction = <T>(
+		tx: OpenTransaction,
+		call: () => Promise<T>,
+		statement = true,
+	): Promise<T> => {
+		if (!abortsOnFailure) return call();
+		const answer = call().then(
+			(value) => {
+				if (statement) tx.failure = undefined;
+				return value;
+			},
+			(error: unknown) => {
+				if (!(error instanceof TypeError)) tx.failure ??= { error };
+				throw error;
+			},
+		);
+		const done = answer.then(settled, settled);
+		tx.pending.add(done);
+		void done.then(() => tx.pending.delete(done));
+		return answer;
+	};
+
+	/**
+	 * `pg`: wait for what the transaction's context sent and did not await, then refuse
+	 * to commit a transaction a failure aborted. Called once its callback resolved, so
+	 * nothing new is added meanwhile: the context is no longer the transaction's.
+	 */
+	const assertNotAborted = async (tx: OpenTransaction): Promise<void> => {
+		if (!abortsOnFailure) return;
+		while (tx.pending.size > 0) await Promise.all(tx.pending);
+		if (tx.failure === undefined) return;
+		throw new TransactionAbortedError(
+			"a statement inside the transaction failed, and Postgres aborted the " +
+				"transaction with it: it was rolled back, not committed. The callback " +
+				"caught that statement's error and returned as if it had succeeded",
+			dialect,
+			{ kind: "aborted" },
+			tx.failure.error,
+		);
+	};
+
 	const execOn = (connection: Connection, script: string): Promise<void> =>
 		guard(() => connection.exec(script));
 
@@ -251,7 +323,7 @@ export function createSingleConnectionDriver(
 		const answer =
 			tx === undefined
 				? enqueue(() => runOn(backend, text, values))
-				: runOn(tx.connection, text, values);
+				: inTransaction(tx, () => runOn(tx.connection, text, values));
 		return answer as Promise<QueryResult<T>>;
 	};
 
@@ -266,7 +338,7 @@ export function createSingleConnectionDriver(
 		const tx = openTransaction();
 		return tx === undefined
 			? enqueue(() => execOn(backend, script))
-			: execOn(tx.connection, script);
+			: inTransaction(tx, () => execOn(tx.connection, script));
 	};
 
 	const transaction = <T>(
@@ -291,9 +363,15 @@ export function createSingleConnectionDriver(
 			let thrown: Thrown | undefined;
 			try {
 				return await backend.transaction(async (connection) => {
-					const tx: OpenTransaction = { open: true, connection };
+					const tx: OpenTransaction = {
+						open: true,
+						connection,
+						failure: undefined,
+						pending: new Set(),
+					};
+					let result: T;
 					try {
-						return await current.run(tx, () => invoke(fn));
+						result = await current.run(tx, () => invoke(fn));
 					} catch (error) {
 						thrown = { error };
 						throw error;
@@ -302,6 +380,9 @@ export function createSingleConnectionDriver(
 						// left running is a stranger from here on, and queues like one.
 						tx.open = false;
 					}
+					// Not the callback's error: thrown here, the backend rolls back.
+					await assertNotAborted(tx);
+					return result;
 				}, readOnly);
 			} catch (error) {
 				throw fromTransaction(error, thrown);
@@ -367,13 +448,14 @@ export function createSingleConnectionDriver(
 		// Re-entrant.
 		if (holds(name)) return invoke(fn);
 		// Inside an open transaction the transaction is the lock, on this connection.
-		if (openTransaction() !== undefined) {
+		const tx = openTransaction();
+		if (tx !== undefined) {
 			if (lock === undefined) return invoke(fn);
 			return hold(name, () =>
 				underLock(
 					fn,
-					() => lock(name, true),
-					(free) => free(),
+					() => inTransaction(tx, () => lock(name, true), false),
+					(free) => inTransaction(tx, free, false),
 				),
 			);
 		}

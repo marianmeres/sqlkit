@@ -1,21 +1,22 @@
 /**
  * The shapes the Postgres adapter takes, declared structurally: a node-postgres `pg.Pool`
- * fits them as it is, and so does anything shaped like one. The adapter imports nothing
- * from `pg`, not even its types, so the package has no peer dependency and the host
- * decides which `pg` it runs and how its pool is configured.
+ * or `pg.Client` fits them as it is, and so does anything shaped like one. The adapter
+ * imports nothing from `pg`, not even its types, so the package has no peer dependency and
+ * the host decides which `pg` it runs and how its pool or client is configured.
  *
  * Only what the adapter calls is declared.
  */
 
-/** How `createPgDriver` binds its driver to the database. */
+/** How `createPgDriver` and `createPgClientDriver` bind their driver to the database. */
 export interface PgDriverOptions {
 	/**
 	 * One schema, applied as the whole `search_path` of every connection the driver
-	 * checks out, once per connection: a table is created in, and found in, exactly one
-	 * place. Left unset, the pool's own `search_path` stands.
+	 * uses, once per connection, before its first statement there: a table is created
+	 * in, and found in, exactly one place. Left unset, the connection's own `search_path`
+	 * stands.
 	 *
-	 * It is set on the connection, not per statement, so another user of the same pool
-	 * that is handed that connection later sees it too.
+	 * It is set on the connection, not per statement, so whoever uses that connection
+	 * afterwards sees it too: another user of the same pool, or the host on its client.
 	 */
 	schema?: string;
 }
@@ -46,6 +47,23 @@ export interface PgQueryConfigLike {
 /** One session a statement runs on: a `pg.PoolClient` a pool handed out, or a `pg.Client`. */
 export interface PgClientLike {
 	query(config: PgQueryConfigLike): Promise<PgQueryResultLike>;
+}
+
+/**
+ * One client of its own, not a pool's: a node-postgres `pg.Client` the host connected, or
+ * anything shaped like one. What `createPgClientDriver` takes.
+ */
+export interface PgStandaloneClientLike extends PgClientLike {
+	/** Disconnect. What the driver's `close()` calls. */
+	end(): Promise<void>;
+	/**
+	 * The client's `error` event: its connection failed while nothing was running on it.
+	 * A client nobody listens to ends the process on the first one, so the adapter
+	 * listens.
+	 */
+	on(event: "error", listener: (error: Error) => void): unknown;
+	/** How many `error` listeners there are: the adapter stays quiet when the host listens. */
+	listenerCount(event: "error"): number;
 }
 
 /** A connection a pool handed out: a `pg.PoolClient`, or anything shaped like one. */
