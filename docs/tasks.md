@@ -34,7 +34,8 @@ of the single-connection driver core. A pool of many connections is not: follow
 9. Put what only this adapter does in `test/<name>/<topic>.test.ts`, under
    `describe("<name>/<topic>")`, with a header saying why it is not a conformance case.
 10. Update the adapter table in `docs/architecture.md` and the structure table in
-    `AGENTS.md`.
+    `AGENTS.md`. Add the entry point's section to `API.md`, every export under it
+    (`test/unit/api-docs.test.ts`), and its quick start and table row to `README.md`.
 
 ### Template
 
@@ -128,7 +129,9 @@ export function createExampleDriver(client: ExampleLike): Driver {
 6. Provoke the real failure: a case in `test/conformance/errors.ts` when every adapter can
    raise it, asserting each dialect's fields; otherwise in `test/<adapter>/errors.test.ts`,
    saying why (two connections, a server setting).
-7. Update the error boundary section of `docs/architecture.md` when the kind is retryable.
+7. Update the error boundary section of `docs/architecture.md` when the kind is retryable,
+   and add the class to the error table in `API.md` (`test/unit/api-docs.test.ts`) and
+   to the list in `README.md`.
 
 ### Checklist
 

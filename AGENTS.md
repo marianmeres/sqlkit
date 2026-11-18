@@ -63,13 +63,19 @@ checks and migrations. Not an ORM, not a query builder. An app commits to one di
       `src/core/contract.ts`.
 - [ ] Follow `docs/conventions.md`; for a recurring change, `docs/tasks.md`.
 - [ ] `pnpm run format`, then `pnpm run ci` green (needs the test Postgres).
-- [ ] Update the docs the change invalidates: this file, `docs/`.
+- [ ] Update the docs the change invalidates: this file, `docs/`, `README.md`, `API.md`.
+      A new export goes in `API.md` under its entry point
+      (`test/unit/api-docs.test.ts`); a new entry point in `package.json`'s `exports`
+      (`test/unit/exports.test.ts`).
 
 Source comments cite decisions as `Dnn` and plan sections as "plan doc NN #n": both are in
 the plan set under `docs/plans/v0-foundation/`.
 
 ## Documentation Index
 
+- [README](./README.md): what sqlkit is and is not, a quick start per adapter, the
+  caveats
+- [API](./API.md): every export of every entry point
 - [Architecture](./docs/architecture.md): layers, the single-connection rule, tiers,
   adapters, the error boundary, migrations
 - [Conventions](./docs/conventions.md): SQL, parameters, errors, testing, runtime,

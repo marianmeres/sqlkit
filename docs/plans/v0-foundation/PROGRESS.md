@@ -64,7 +64,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
 | ✅ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
 | ✅ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
-| ⬜ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
+| ✅ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
 | ⬜ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 D34 | — |
 | ⬜ | T20 | T19 | Archive this plan set; copy the backlog to `docs/backlog.md` | [04](./04-scaffold-docs-release.md) #4 | D22 | — |
 
@@ -601,6 +601,32 @@ D34 changes says so where it stands.
      each case's instance from it (about 0.1 s), so every case still gets an empty
      database of its own. `pnpm run test:pglite` selects the adapter's cases, as `test:pg`
      and `test:sqlite` do, and `^pg\b` does not match `pglite`.
+
+- **D39** (2026-11-18, T18 session) — Found while writing the human docs and their two
+  tests; open to veto ([04](./04-scaffold-docs-release.md) #3).
+  1. `API.md` has one `##` section per entry point, its heading the import specifier in a
+     code span. A name counts as documented by a code span in a heading inside it, or by
+     the code span opening a table row (the error classes, the pg structural types); a
+     span stands for the identifier it starts with (`decode.bool` is `decode`). The test
+     also runs the other way: a name a heading documents must be one the entry point
+     exports, so a removed export cannot leave a stale entry behind.
+  2. Exports are read from the source's text, comments stripped (TypeScript 7.0's
+     compiler API is exported only under `typescript/unstable/*`, too loose to pin a test
+     to), and the values read are compared with `Object.keys` of the module imported at
+     runtime. An `export` the reader cannot read, `export *` and `export default` fail the
+     test rather than hide names.
+  3. `test/unit/exports.test.ts` checks more than the section asks, each check cheap and a
+     real way to ship a broken package: a subpath names its source (`"./x"` is
+     `src/x/mod.ts` or `src/x.ts`), a key's `types` and `import` come from one source,
+     `types` is the first condition, `main` and `types` are `src/mod.ts`'s,
+     `tsconfig.build.json` maps `src` to `dist`, and every name in `files` but `dist`
+     exists. `test/unit/_package.ts` holds what the two tests share.
+  4. `README.md` carries no badge at all: the npm ones resolve nothing for a restricted
+     package, and so does the license badge, which shields.io reads from npm. Its
+     examples were run on node:sqlite, PGlite, the pool and one client before commit.
+  5. `AGENTS.md` (checklist, index) and `docs/tasks.md` (add an adapter, add an error
+     kind) now name `README.md`, `API.md` and the two tests, since following them as they
+     were would fail `api-docs`.
 
 ## How to resume (for a fresh conversation)
 
