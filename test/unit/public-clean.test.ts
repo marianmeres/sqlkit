@@ -16,6 +16,8 @@ const PUBLIC = new Set([
 	"migrate",
 	"semver",
 	"item-collection",
+	"pubsub",
+	"searchable",
 	"release",
 	"steve",
 	"cron",

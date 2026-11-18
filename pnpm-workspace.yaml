@@ -3,3 +3,8 @@
 allowBuilds:
   esbuild: true
   workerd: true
+# Exact versions let past pnpm's release-age gate, each published the day it was added:
+# @marianmeres/migrate 2.0.0 (the migrate wiring's base, D06) and the semver it requires.
+minimumReleaseAgeExclude:
+  - '@marianmeres/migrate@2.0.0'
+  - '@marianmeres/semver@1.0.1'

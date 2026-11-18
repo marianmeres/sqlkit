@@ -27,6 +27,10 @@
     "./pg": {
       "types": "./dist/pg/mod.d.ts",
       "import": "./dist/pg/mod.js"
+    },
+    "./migrate": {
+      "types": "./dist/migrate/mod.d.ts",
+      "import": "./dist/migrate/mod.js"
     }
   },
   "files": [
@@ -73,6 +77,9 @@
     "release": "npx --yes @marianmeres/release@^2.2.0",
     "rp": "pnpm run release -y && pnpm publish",
     "rpm": "pnpm run release minor -y && pnpm publish"
+  },
+  "dependencies": {
+    "@marianmeres/migrate": "^2.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8",

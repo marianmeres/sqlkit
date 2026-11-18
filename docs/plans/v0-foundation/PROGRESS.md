@@ -58,7 +58,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | b196fbe |
 | ✅ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | 281d3cd |
 | ✅ | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 D34 | — |
-| ⬜ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
+| ✅ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
 | ⬜ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 | — |
 | ⬜ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
 | ⬜ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
@@ -476,6 +476,33 @@ D34 changes says so where it stands.
      (`DatabaseSync`'s `enableForeignKeyConstraints` is true; probed on Node 26.13.1),
      so every adapter enforces them and F12's contrast with "node:sqlite's default
      (off)" was wrong. D23 stands: `openSqlite` sets nothing more.
+
+- **D35** (2026-11-18, T13 session) — Found while wiring `@marianmeres/migrate` over a
+  `Driver`; open to veto ([03](./03-conventions.md) #2).
+  1. pnpm's release-age gate refused `@marianmeres/migrate@2.0.0` and also
+     `@marianmeres/semver@1.0.1`, published the same day and required by it (`^1.0.1`).
+     Both are excluded at their exact versions in `pnpm-workspace.yaml`, with a comment. The
+     lockfile now names `@marianmeres/pubsub` and `@marianmeres/searchable` (public, through
+     `item-collection`), so the public-clean allowlist gains both.
+  2. No "inside a run" flag. `getActiveVersion` checks that the table exists on every read,
+     in a run too (one statement), and a step's `setActiveVersion` runs the
+     `create table if not exists` again inside the step's transaction (a no-op). A flag on
+     the instance is blind to async context: on a pool, a `setActiveVersion()` from outside a
+     run in progress would see it set and skip the lock.
+  3. `createMigrate` refuses with a `TypeError`: a `db` not shaped like a driver, an
+     `options` that is not an object, a `table` that is not a string matching the package's
+     pattern (`null` included: the package's `??` takes `null` as the default), a `context`
+     that is not an object (an array included), a `logger` that is not a function.
+  4. A worker receives `{ ...context, db }`: `db` wins over an extra key of that name, as
+     the package's helpers do. `MigrateOptions` keeps the plan's
+     `Record<string, unknown>` bound on `TExtra`.
+  5. The interop suites pin the version table (Postgres: `information_schema.columns`;
+     SQLite: the `sqlite_master` text, equal character for character) and the run lock both
+     ways. On Postgres a run of either waits for the other, and a lock name other than
+     `migrate:<table>` fails that case (checked by mutation). On SQLite the exclusion is
+     shown with a busy timeout of 0, since a waiting handle would block the thread its
+     holder needs: the helper's `BEGIN IMMEDIATE` is refused with `database is locked`, and
+     `createMigrate`'s run with an `Error` whose `cause` is a `BusyError`.
 
 ## How to resume (for a fresh conversation)
 
