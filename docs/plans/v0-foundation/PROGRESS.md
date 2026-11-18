@@ -59,7 +59,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | 281d3cd |
 | ✅ | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 D34 | — |
 | ✅ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
-| ⬜ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 | — |
+| ✅ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 D36 | — |
 | ⬜ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
 | ⬜ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
 | ⬜ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
@@ -503,6 +503,32 @@ D34 changes says so where it stands.
      shown with a busy timeout of 0, since a waiting handle would block the thread its
      holder needs: the helper's `BEGIN IMMEDIATE` is refused with `database is locked`, and
      `createMigrate`'s run with an `Error` whose `cause` is a `BusyError`.
+
+- **D36** (2026-11-18, T14 session) — Found while loading SQL files as versions; open to
+  veto ([03](./03-conventions.md) #4).
+  1. Every refusal is a `TypeError` (a rejection, `addSqlFiles` being async), its message
+     `addSqlFiles: <path>: <reason>`, the path the file's or, for an empty directory, the
+     directory's. A missing directory rejects with the file system's own `ENOENT`, unwrapped.
+  2. "One version" is semver precedence, not the normalized text: `1`, `1.0.0` and `01`
+     are one version, and so are `1.0.0+a` and `1.0.0+b`, since `compareSemver` orders each
+     pair as equal and the package would otherwise register both and order them by their
+     text. A version the instance already has is refused too, checked after the reads
+     with nothing awaited before the first registration, so a refusal registers nothing.
+  3. An up and a down pair by version, not by label; the label is the up file's, handed
+     to `addVersion` as the comment. The label is the text after the first `__` (a version
+     holds no `_`), any characters, but not empty. The `.sql` test is case-insensitive, so
+     `2.UP.SQL` is refused rather than silently ignored; the pattern itself is lowercase.
+  4. Every file is read before the first version is registered, and the text is kept: a
+     file changed afterwards is not read again. A leading byte-order mark is dropped:
+     the test Postgres refuses one (`syntax error at or near "\uFEFFselect"`). node:sqlite
+     accepts it, so the unit suite proves the strip through a recording `exec`.
+  5. The signature is generic, `addSqlFiles<T extends MigrateContext>(migrate: Migrate<T>,
+     dir)`, so an instance from `createMigrate` with extra context is taken as it is. The
+     instance is checked by shape (`addVersion`, `available`), not `instanceof`, since the
+     caller's copy of `@marianmeres/migrate` may not be this package's.
+  6. `compareSemver`, `normalizeSemver` and `parseSemver` come from `@marianmeres/migrate`,
+     which re-exports them: no new dependency. Any directory entry that is not a directory
+     is considered, so a symbolic link to a file loads.
 
 ## How to resume (for a fresh conversation)
 

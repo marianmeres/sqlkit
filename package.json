@@ -31,6 +31,10 @@
     "./migrate": {
       "types": "./dist/migrate/mod.d.ts",
       "import": "./dist/migrate/mod.js"
+    },
+    "./migrate/files": {
+      "types": "./dist/migrate/files.d.ts",
+      "import": "./dist/migrate/files.js"
     }
   },
   "files": [
