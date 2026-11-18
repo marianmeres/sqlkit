@@ -61,7 +61,7 @@ ninth of the second run, added by the T12 review (D34). Rehearse with
 | ✅ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
 | ✅ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 D36 | — |
 | ✅ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
-| ⬜ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
+| ✅ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
 | ⬜ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
 | ⬜ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
 | ⬜ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
@@ -565,6 +565,42 @@ D34 changes says so where it stands.
   7. The savepoint and not-awaited cases live in `test/pg/client.test.ts`, not in the
      `driver` body: a Durable Object refuses `SAVEPOINT` (F04), and the wait for statements
      not awaited is the single-connection core's, which the pool does not have.
+
+- **D38** (2026-11-18, T16 session) — Found while putting PGlite under the single-connection
+  core; open to veto ([02](./02-adapters.md) #6).
+  1. `@electric-sql/pglite@0.5.16` passed pnpm's release-age gate with no exclusion. Its
+     types and its source (read from the installed package's source maps) settled the
+     section's two checks. **R11 holds by the server's refusal**: PGlite's `query` sends one
+     statement on the extended protocol, and a text of several is refused with `42601`
+     before any of it runs. **Its errors carry the SQLSTATE**: a `DatabaseError` with
+     `code`, `constraint`, `table` and `column` named as node-postgres names them, so
+     `classifyPg` reads them unchanged. `test/pglite/pglite.test.ts` pins both shapes.
+  2. PGlite's `transaction` sends `BEGIN` and `COMMIT` itself and checks the `COMMIT`'s tag,
+     throwing its own `TransactionAbortedError` (`25P02`) when it reads `ROLLBACK`. The
+     core refuses to commit first, so a swallowed failure rejects with the core's
+     `TransactionAbortedError` whose `cause` is the failed statement's error, and PGlite
+     rolls back. PGlite's own `25P02` is classified `aborted` too, should it ever come out.
+  3. The backend rethrows the callback's rejection when PGlite answers with a failed
+     `ROLLBACK` instead, as the client backend keeps the cause over a failed `ROLLBACK`.
+  4. `createPgliteDriver(db)` takes no options: PGlite is one database, and a `schema`
+     option was not in the section. The structural shapes are exported: `PgliteLike`,
+     `PgliteTransactionLike`, `PgliteResultsLike`. A value that lacks `query`, `exec`,
+     `transaction` or `close` is a `TypeError`.
+  5. `rowCount` follows the section (`fields.length > 0 ? rows.length : affectedRows ?? 0`),
+     although PGlite 0.5 also answers a per-statement `rowCount`. For one statement the
+     two agree.
+  6. Values PGlite does differently from node-postgres, each documented in the module and
+     none in conflict with a conformance body. PGlite serializes a parameter by the type
+     the server inferred for its placeholder, where node-postgres serializes by the
+     JavaScript value. So where the server infers `text`, an array binds as `1,2`, not
+     `{1,2}`, and a `Date` as ISO text, not local time with an offset. An `int8` reads as a
+     number while it is a safe integer and as a `bigint` beyond it; node-postgres reads it
+     as a string. Cast the placeholder (`cast(${list} as integer[])`) and the two agree.
+  7. Creating an instance runs `initdb` (about 0.6 s). The test fixture
+     (`test/pglite/_fixture.ts`) dumps one fresh data directory per test process and loads
+     each case's instance from it (about 0.1 s), so every case still gets an empty
+     database of its own. `pnpm run test:pglite` selects the adapter's cases, as `test:pg`
+     and `test:sqlite` do, and `^pg\b` does not match `pglite`.
 
 ## How to resume (for a fresh conversation)
 

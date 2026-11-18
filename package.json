@@ -28,6 +28,10 @@
       "types": "./dist/pg/mod.d.ts",
       "import": "./dist/pg/mod.js"
     },
+    "./pglite": {
+      "types": "./dist/pglite/mod.d.ts",
+      "import": "./dist/pglite/mod.js"
+    },
     "./migrate": {
       "types": "./dist/migrate/mod.d.ts",
       "import": "./dist/migrate/mod.js"
@@ -75,6 +79,7 @@
     "test": "node --test --env-file-if-exists=.env \"test/**/*.test.ts\"",
     "test:watch": "node --test --watch --env-file-if-exists=.env \"test/**/*.test.ts\"",
     "test:pg": "node --test --env-file-if-exists=.env --test-name-pattern=\"^pg\\\\b\" \"test/conformance/*.test.ts\" \"test/pg/*.test.ts\"",
+    "test:pglite": "node --test --env-file-if-exists=.env --test-name-pattern=\"^pglite\\\\b\" \"test/conformance/*.test.ts\" \"test/pglite/*.test.ts\"",
     "test:sqlite": "node --test --env-file-if-exists=.env --test-name-pattern=\"^sqlite\\\\b\" \"test/conformance/*.test.ts\" \"test/sqlite/*.test.ts\"",
     "ci": "pnpm run typecheck && pnpm run lint && pnpm test",
     "prepublishOnly": "pnpm run ci && pnpm run build",
@@ -87,6 +92,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8",
+    "@electric-sql/pglite": "^0.5.16",
     "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
     "esbuild": "^0.28.2",
