@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # Node LTS is the dev runtime, the reference and the gate: a red run here blocks.
+  # Nothing runs on Deno or Bun.
+  node:
+    runs-on: ubuntu-latest
+    # The Postgres suites run against a real server: a throwaway one, on the major the
+    # hosts run. The runner assigns its port. Its user owns the database, so it may
+    # create the schema each Postgres test case makes for itself.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: sqlkit
+          POSTGRES_PASSWORD: sqlkit
+          POSTGRES_DB: sqlkit_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U sqlkit -d sqlkit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      # pnpm version is read from package.json "packageManager".
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # A Postgres suite fails, never skips, when these variables are missing.
+      - run: pnpm run ci
+        env:
+          TEST_PG_HOST: localhost
+          TEST_PG_PORT: ${{ job.services.postgres.ports['5432'] }}
+          TEST_PG_DATABASE: sqlkit_test
+          TEST_PG_USER: sqlkit
+          TEST_PG_PASSWORD: sqlkit

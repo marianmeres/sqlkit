@@ -1,0 +1,32 @@
+{
+	"permissions": {
+		"allow": [
+			"Bash(pnpm run *)",
+			"Bash(pnpm test*)",
+			"Bash(pnpm install*)",
+			"Bash(pnpm exec *)",
+			"Bash(node *)",
+			"Bash(ls *)",
+			"Bash(cat *)",
+			"Bash(mkdir *)",
+			"Bash(wc *)",
+			"Bash(head *)",
+			"Bash(tail *)",
+			"Bash(grep *)",
+			"Bash(diff *)",
+			"Bash(which *)",
+			"Bash(pnpm biome *)",
+			"Bash(pnpm tsc *)"
+		],
+		"deny": [
+			"Bash(git push*)",
+			"Bash(git reset*)",
+			"Bash(git clean*)",
+			"Bash(git rebase*)",
+			"Bash(git remote*)",
+			"Bash(npm publish*)",
+			"Bash(pnpm publish*)",
+			"Bash(bun publish*)"
+		]
+	}
+}

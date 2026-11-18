@@ -1,0 +1,72 @@
+{
+  "name": "@marianmeres/sqlkit",
+  "version": "0.0.0",
+  "description": "A thin, convention-driven SQL toolkit for PostgreSQL and SQLite: safe composable sql fragments, one driver contract with a sync tier, typed errors, transactions, retry and migrations. Not an ORM, not a query builder.",
+  "license": "MIT",
+  "author": "Marian Meres",
+  "type": "module",
+  "packageManager": "pnpm@12.18.0",
+  "engines": {
+    "node": ">=24.12"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "sideEffects": false,
+  "main": "./dist/mod.js",
+  "types": "./dist/mod.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/mod.d.ts",
+      "import": "./dist/mod.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "API.md",
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marianmeres/sqlkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/marianmeres/sqlkit/issues"
+  },
+  "homepage": "https://github.com/marianmeres/sqlkit#readme",
+  "keywords": [
+    "sql",
+    "postgres",
+    "postgresql",
+    "sqlite",
+    "node-sqlite",
+    "pglite",
+    "durable-objects",
+    "tagged-template",
+    "transactions",
+    "migrations",
+    "driver"
+  ],
+  "scripts": {
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "node --test --env-file-if-exists=.env \"test/**/*.test.ts\"",
+    "test:watch": "node --test --watch --env-file-if-exists=.env \"test/**/*.test.ts\"",
+    "ci": "pnpm run typecheck && pnpm run lint && pnpm test",
+    "prepublishOnly": "pnpm run ci && pnpm run build",
+    "release": "npx --yes @marianmeres/release@^2.2.0",
+    "rp": "pnpm run release -y && pnpm publish",
+    "rpm": "pnpm run release minor -y && pnpm publish"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
