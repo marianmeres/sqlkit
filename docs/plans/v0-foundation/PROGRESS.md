@@ -46,7 +46,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | Status | ID  | Deps | Task | Source | Decisions | Commit |
 | ------ | --- | ---- | ---- | ------ | --------- | ------ |
 | ✅ | T01 | — | Owner pre-flight: scaffold, `.claude/settings.json`, test database and `.env`, first commit on `master` | [04](./04-scaffold-docs-release.md) #1 | D02 D20 D21 | — |
-| ⬜ | T02 | T01 | `sql` fragments: `sql`, `raw`, `bind`, `join`, `ident`, `json`, `render`; the core-imports guard | [01](./01-core.md) #1 | D02 D21 | — |
+| ✅ | T02 | T01 | `sql` fragments: `sql`, `raw`, `bind`, `join`, `ident`, `json`, `render`; the core-imports guard | [01](./01-core.md) #1 | D02 D21 | — |
 | ⬜ | T03 | T02 | Contract types, the parameter rule, `SqlError` classes, the pg and sqlite classifiers | [01](./01-core.md) #2, #3 | D07 D10 D11 D14 D17 | — |
 | ⬜ | T04 | T03 | Durable Objects spike: workerd harness under `node:test`, assumptions A1–A6, probes P1–P8, `DO-FINDINGS.md` | [02](./02-adapters.md) #1 | D03 D05 D20 D24 | — |
 | ⬜ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
@@ -174,6 +174,15 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
 - **D24** (2026-11-18, plan author) — The Durable Objects adapter requires the
   `nodejs_compat` flag, for `AsyncLocalStorage`. T04 checks that it is enough; T12
   confirms or overturns this.
+- **D25** (2026-11-18, T02 session) — A fragment is recognized by a non-enumerable
+  `Symbol.for` brand its builders set, not by `kind: "sql"` alone as the prior
+  implementation's `isSql` did. Reason: D14 binds a plain object as JSON, so a parsed
+  request body shaped `{ "kind": "sql", "chunks": [...] }` would otherwise be spliced into
+  the statement as SQL text. A look-alike is bound as a value by `sql`, and refused with a
+  `TypeError` by `join` and `render`. The `Sql` interface is unchanged; `Symbol.for` lets
+  two copies of the package accept each other's fragments. Also from T02: a template chunk
+  with an invalid escape (cooked `undefined`) is a `TypeError`, not dropped text. Open to
+  veto at T12 ([01](./01-core.md) #1).
 
 ## How to resume (for a fresh conversation)
 
