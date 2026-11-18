@@ -56,7 +56,8 @@
  * `process.emitWarning`.
  *
  * `exec()` sends its script as one simple query, with no parameters, so it may hold any
- * number of statements.
+ * number of statements. `query()` sends its text on the extended protocol, parameters or
+ * not, so a text of several statements is refused by the server before any of it runs.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -148,8 +149,10 @@ async function guard<T>(call: () => Promise<T>): Promise<T> {
 }
 
 /**
- * One statement on `client`, guarded. Without `values` node-postgres sends a simple query,
- * which may hold several statements; with them, even none, one statement.
+ * Text on `client`, guarded. Without `values` node-postgres sends it as a simple query,
+ * which runs every statement it holds: what `exec()` and the adapter's own statements
+ * want. With `values`, even none, it goes as one statement on the extended protocol, and
+ * the server refuses a text of several before running any of it: what `query()` wants.
  */
 function send(
 	client: PgClientLike,
@@ -157,7 +160,9 @@ function send(
 	values?: unknown[],
 ): Promise<PgQueryResultLike> {
 	return guard(() =>
-		values === undefined ? client.query(text) : client.query(text, values),
+		values === undefined
+			? client.query({ text })
+			: client.query({ text, values, queryMode: "extended" }),
 	);
 }
 
@@ -226,8 +231,8 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		values: unknown[],
 	): Promise<QueryResult<T>> => {
 		const result = await send(client, text, values);
-		// Without parameters node-postgres sends a simple query, which runs every
-		// statement of the text and answers one result each.
+		// The extended protocol answers one result. Several mean a node-postgres that
+		// ignored `queryMode` and sent a simple query, which ran every statement.
 		if (Array.isArray(result)) {
 			throw new TypeError(
 				"query() runs one statement, and this text held several (each of them ran): " +

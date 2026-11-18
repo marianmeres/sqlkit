@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import pg from "pg";
+import { SqlError } from "../../src/mod.ts";
 import { createPgDriver, type PgPoolLike } from "../../src/pg/mod.ts";
 import { testPgConfig } from "../_env.ts";
 import { createPgFixture } from "./_fixture.ts";
@@ -99,23 +100,52 @@ describe("pg/adapter: createPgDriver", () => {
 		}
 	});
 
-	test("query() refuses a text of several statements, and names exec()", async () => {
+	test("query() sends on the extended protocol: the server refuses several statements", async () => {
 		const fixture = await createPgFixture();
 		try {
 			const { driver } = fixture;
-			// Without parameters node-postgres runs every statement of the text, so the
-			// refusal comes after them: what it prevents is a garbled answer.
+			await driver.exec("create table t (id text)");
+			// Without `queryMode` node-postgres would send a parameterless text as a simple
+			// query, and run both inserts.
 			await assert.rejects(
 				driver.query(
-					"create table t (id text); insert into t (id) values ('ran')",
+					"insert into t (id) values ('one'); insert into t (id) values ('two')",
 				),
-				typeError(/exec\(\)/),
+				(error) =>
+					error instanceof SqlError &&
+					error.kind === "unknown" &&
+					error.code === "42601" &&
+					/multiple commands/.test(error.message),
 			);
-			assert.deepEqual((await driver.query("select id from t")).rows, [
-				{ id: "ran" },
-			]);
+			assert.deepEqual((await driver.query("select id from t")).rows, []);
+			// What the extended protocol takes, a statement that refuses a transaction too.
+			await driver.query("create index concurrently t_id on t (id)");
 		} finally {
 			await fixture.dispose();
 		}
+	});
+
+	test("query() on a node-postgres that ignores queryMode refuses after, naming exec()", async () => {
+		// A simple query answers one result per statement, which only a node-postgres that
+		// predates `queryMode` would send for a text with no values.
+		const result = { rows: [], rowCount: 1, command: "INSERT" };
+		const pool: PgPoolLike = {
+			connect: () =>
+				Promise.resolve({
+					query: () => Promise.resolve([result, result] as never),
+					release: () => {},
+				}),
+			end: () => Promise.resolve(),
+			on: () => undefined,
+			listenerCount: () => 1,
+		};
+		await assert.rejects(
+			createPgDriver(pool).query(
+				"insert into t values (1); insert into t values (2)",
+			),
+			typeError(
+				/held several \(each of them ran\): a script goes through exec\(\)/,
+			),
+		);
 	});
 });

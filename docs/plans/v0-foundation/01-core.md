@@ -187,7 +187,7 @@ README) and against node:sqlite on Node 26.13.1. Planning artifact; no code was 
   | Rule | Statement |
   |------|-----------|
   | R1 | `query` and `exec` always answer with a promise; a failing statement rejects, never throws at the call. |
-  | R2 | `rowCount` is as `QueryResult` says, for `SELECT`, a plain write, and a write with `RETURNING`. |
+  | R2 | `rowCount` is as `QueryResult` says, for `SELECT`, a plain write, and a write with `RETURNING`. For any other statement it is a number and nothing more (D34.2). |
   | R3 | `transaction` commits when `fn` resolves and rolls back when it rejects. On the `pg` dialect, where a failed statement aborts the transaction, a callback that swallowed the failure and resolved gets a rejection, not a silent rollback. (SQLite has no aborted state: the rest of the transaction commits.) |
   | R4 | A nested `transaction` joins the open one, as it was opened. |
   | R5 | A statement belongs to the transaction whose callback issued it, and to no other (D09). One from elsewhere neither sees its uncommitted rows nor goes with its rollback. |
@@ -195,7 +195,8 @@ README) and against node:sqlite on Node 26.13.1. Planning artifact; no code was 
   | R7 | `readOnly` reads one snapshot and refuses a write. |
   | R8 | `exclusive` serializes callers of one name, is re-entrant, lets two names run together, releases on rejection, and inside an open transaction belongs to that transaction. |
   | R9 | `exec` runs every statement of a script and joins the open transaction. |
-  | R10 | Parameters follow the table above. Rows are plain objects. |
+  | R10 | Parameters follow the table above. Rows are plain objects. Bytes read back as a `Uint8Array` (D34.7). |
+  | R11 | `query` runs one statement: a text holding more is refused before any of it runs, with a `TypeError` where the adapter sees it and the database's own refusal where the database does. Blanks, `;` and comments after it are not a statement. Added at T12 (D34.1). |
 - **Done when** — `pnpm run typecheck` passes with `src/core/contract.ts` and
   `src/core/params.ts` in place; `test/unit/params.test.ts` passes with a case per table
   cell; `test/unit/contract.test.ts` passes for `readOnlyOf`, `assertLockName` and
@@ -362,6 +363,9 @@ README) and against node:sqlite on Node 26.13.1. Planning artifact; no code was 
   decisions log (D09–D24) and the affected sections first.
 - **Done when** — The owner sets T12 to `✅`, with any change recorded as a new `D##`.
 - **Effort / Value / Risk** — S / high / low.
+- **Outcome** — Done 2026-11-18, the review delegated by the owner: D34. Four changes
+  landed with it (R11, the `update`/`deleteFrom` match, `decode.instant`, the `rowCount`
+  doc), one became row T33, and the Durable Objects points went to 02 #7.
 
 ## Open questions / decisions needed
 

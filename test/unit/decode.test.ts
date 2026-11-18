@@ -112,6 +112,33 @@ describe("unit/decode: the decoders", () => {
 		);
 	});
 
+	test("instant reads a date and time with no offset as UTC, as SQLite writes it", (t) => {
+		// `Date` alone would read these as local time, wrong by the host's offset, and on a
+		// host whose zone is UTC (CI) nothing would show it: so not one here. Node applies a
+		// change of TZ at once, and this file runs in a process of its own.
+		const zone = process.env.TZ;
+		process.env.TZ = "Asia/Kathmandu"; // +05:45, no daylight saving
+		t.after(() => {
+			if (zone === undefined) delete process.env.TZ;
+			else process.env.TZ = zone;
+		});
+		assert.equal(new Date(2026, 0, 2).getTimezoneOffset(), -345);
+		const utc = (ms: number) => new Date(Date.UTC(2026, 0, 2, 3, 4, 5, ms));
+		assert.deepEqual(decode.instant("2026-01-02 03:04:05", "col"), utc(0));
+		assert.deepEqual(decode.instant("2026-01-02T03:04:05", "col"), utc(0));
+		assert.deepEqual(decode.instant("2026-01-02 03:04:05.678", "col"), utc(678));
+		assert.deepEqual(decode.instant("2026-01-02T03:04:05.678123", "col"), utc(678));
+		assert.deepEqual(
+			decode.instant("2026-01-02 03:04", "col"),
+			new Date(Date.UTC(2026, 0, 2, 3, 4)),
+		);
+		// An offset is honoured as it is written.
+		assert.deepEqual(decode.instant("2026-01-02 04:04:05+01:00", "col"), utc(0));
+		refuses(decode.instant, "instant", [
+			["2026-13-02 03:04:05", /a string that is not a valid date$/],
+		]);
+	});
+
 	test("instant refuses an invalid date, and anything that is not a date", () => {
 		refuses(decode.instant, "instant", [
 			[new Date(Number.NaN), /a Date that is not a valid date$/],

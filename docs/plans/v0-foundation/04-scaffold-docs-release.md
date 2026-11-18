@@ -107,7 +107,7 @@ Planning artifact; no code was changed.
 - **Affected files** — the six files and the test.
 - **Effort / Value / Risk** — M / med / low.
 - **Implementation notes** — Describe what the code does today, by reading it. The rules
-  R1–R10 and S1–S6 are quoted from the conformance bodies, not from this plan: the plan is
+  R1–R11 and S1–S6 are quoted from the conformance bodies, not from this plan: the plan is
   archived by T20 and must not be the docs' source.
 
 ### 3. Human docs

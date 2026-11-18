@@ -17,6 +17,7 @@ import {
 	insert,
 	json,
 	type Row,
+	raw,
 	type SyncDriver,
 	sql,
 } from "../../src/mod.ts";
@@ -91,6 +92,22 @@ export function decodersContract(suite: Suite, adapter: AdapterCase): void {
 		const { rows } = await db.query(SELECT);
 		if (db.dialect === "sqlite") assertSqliteRaw(rows);
 		assert.deepEqual(decodeRows(rows, SPEC), EXPECTED);
+	});
+
+	test("decoders: a time the database wrote itself decodes to when it was written", async (db) => {
+		// SQLite writes `current_timestamp` as UTC with no offset, to the second; Postgres
+		// hands back a `Date`. The margin is for SQLite's second; a misread zone is hours.
+		const before = Date.now();
+		await db.query(insert("thing", { id: 9, at: raw("current_timestamp") }));
+		const after = Date.now();
+		const { rows } = await db.query(sql`select at from thing where id = 9`);
+		const decoded = decodeRows(rows, { at: decode.instant })[0]?.at;
+		assert.ok(decoded instanceof Date, `decoded ${String(decoded)}`);
+		const at = decoded.getTime();
+		assert.ok(
+			at >= before - 2_000 && at <= after + 2_000,
+			`decoded ${new Date(at).toISOString()} from ${String(rows[0]?.at)}, written between ${new Date(before).toISOString()} and ${new Date(after).toISOString()}`,
+		);
 	});
 
 	test("decoders: a decoded row keeps the columns the spec does not name", async (db) => {

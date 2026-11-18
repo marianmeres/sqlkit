@@ -28,7 +28,11 @@
  *   transaction.
  * - **R9** `exec` runs every statement of a script and joins the open transaction.
  * - **R10** Parameters follow the one parameter rule (`params.ts`). Rows are plain
- *   objects.
+ *   objects. Bytes read back as a `Uint8Array` (node-postgres's `Buffer` is one).
+ * - **R11** `query` runs one statement: a text holding more is refused before any of it
+ *   runs, with a `TypeError` where the adapter sees it, or the database's own refusal
+ *   where the database does. Blanks, semicolons and comments after it are not a
+ *   statement. A script goes through `exec`.
  *
  * Runtime-neutral: imports only the fragment builder.
  */
@@ -46,7 +50,9 @@ export interface QueryResult<T = Row> {
 	rows: T[];
 	/**
 	 * Rows returned, for a statement that returns rows (a `SELECT`, a write with
-	 * `RETURNING`); rows affected otherwise (a plain `INSERT`, `UPDATE` or `DELETE`).
+	 * `RETURNING`); rows affected, for a plain `INSERT`, `UPDATE` or `DELETE`. For any other
+	 * statement (DDL, a `SET`, a pragma) it is a number and nothing more: SQLite reports
+	 * the previous write's count there.
 	 */
 	rowCount: number;
 }
@@ -103,7 +109,8 @@ export interface Driver {
 	readonly capabilities: Capabilities;
 	/**
 	 * Run one statement: a fragment, or text with its parameters. Always answers with a
-	 * promise: a failing statement rejects, never throws at the call.
+	 * promise: a failing statement rejects, never throws at the call. A text of several
+	 * statements is refused before any of them runs; a script goes through `exec`.
 	 */
 	query<T = Row>(statement: Sql): Promise<QueryResult<T>>;
 	query<T = Row>(text: string, params?: readonly unknown[]): Promise<QueryResult<T>>;

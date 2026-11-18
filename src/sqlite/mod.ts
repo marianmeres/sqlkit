@@ -10,6 +10,10 @@
  * The handle is synchronous, so the driver has a sync tier too: `driver.sync`, the same
  * handle answering at once, with a transaction whose callback is synchronous.
  *
+ * `query()` runs one statement. node:sqlite would compile a text's first statement and
+ * drop the rest without a word, so a text holding more is refused with a `TypeError`
+ * before any of it runs; `exec()` is for a script.
+ *
  * Two entry points:
  *
  * - `createSqliteDriver(db)` takes a database the host opened and sets nothing on it: its
@@ -124,6 +128,34 @@ function prepare(db: DatabaseSync, text: string): StatementSync {
 	return statement;
 }
 
+/**
+ * Whether `text` from `from` on holds no statement: only blanks, `;` and comments, which is
+ * what may follow the one statement a `query()` runs. A linear scan, not a regular
+ * expression: a run of dashes would make one backtrack exponentially.
+ */
+function onlyTrivia(text: string, from: number): boolean {
+	let i = from;
+	while (i < text.length) {
+		const c = text.charCodeAt(i);
+		// `;`, space, tab, newline, vertical tab, form feed, carriage return.
+		if (c === 59 || c === 32 || (c >= 9 && c <= 13)) {
+			i++;
+		} else if (text.startsWith("--", i)) {
+			const end = text.indexOf("\n", i + 2);
+			if (end === -1) return true;
+			i = end + 1;
+		} else if (text.startsWith("/*", i)) {
+			// SQLite reads an unterminated block comment to the end of the text.
+			const end = text.indexOf("*/", i + 2);
+			if (end === -1) return true;
+			i = end + 2;
+		} else {
+			return false;
+		}
+	}
+	return true;
+}
+
 /** node:sqlite hands back rows without a prototype; the contract's rows are plain. */
 function plainRow(row: Record<string, unknown>): Row {
 	return { ...row };
@@ -136,6 +168,13 @@ function sqliteBackends(db: DatabaseSync): {
 } {
 	const run = (text: string, params: readonly unknown[]): QueryResult<Row> => {
 		const statement = prepare(db, text);
+		// node:sqlite compiles a text's first statement and ignores the rest, silently.
+		if (!onlyTrivia(text, statement.sourceSQL.length)) {
+			throw new TypeError(
+				"query() runs one statement, and this text holds more (none of it ran): " +
+					"a script goes through exec()",
+			);
+		}
 		// The core bound every value by the parameter rule: each is one SQLite takes.
 		const values = params as SQLInputValue[];
 		// Rows or a count by what the statement returns, not by a keyword: a write with

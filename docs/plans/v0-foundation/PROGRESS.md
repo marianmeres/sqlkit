@@ -39,8 +39,9 @@ Verify: pnpm run ci
 
 **Pre-flight.** T01 is done by hand and is what makes the `Verify:` command pass at all;
 [04](./04-scaffold-docs-release.md) #1 lists it. The run stops at T12 on purpose and is
-started again after the owner ticks it. No `Options:` line: eighteen machine rows in two
-runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehearse with
+started again after the owner ticks it. No `Options:` line: nineteen machine rows in two
+runs of ten and nine fit the driver's defaults (`sprint -h` prints them); T33 is the
+ninth of the second run, added by the T12 review (D34). Rehearse with
 `sprint docs/plans/v0-foundation --dry-run`.
 
 | Status | ID  | Deps | Task | Source | Decisions | Commit |
@@ -56,18 +57,20 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | f4fac26 |
 | ✅ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | b196fbe |
 | ✅ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | 281d3cd |
-| 🔒 | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 | — |
+| ✅ | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 D34 | — |
 | ⬜ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
 | ⬜ | T14 | T13 | SQL files as versions (`./migrate/files`) | [03](./03-conventions.md) #4 | D06 D19 | — |
-| ⬜ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 | — |
-| ⬜ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 | — |
-| ⬜ | T17 | T16 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
+| ⬜ | T15 | T14 | `createPgClientDriver`: one `pg.Client` as a single-connection backend; aborted-transaction tracking in the core | [02](./02-adapters.md) #5 | D08 D15 D34 | — |
+| ⬜ | T16 | T15 | PGlite adapter (`./pglite`) | [02](./02-adapters.md) #6 | D05 D15 D34 | — |
+| ⬜ | T33 | T12 | A timeout on the health check: `timeoutMs` on `checkHealth` and `createHealthMonitor` | [03](./03-conventions.md) #6 | D33 D34 | — |
+| ⬜ | T17 | T16 T33 | Agent docs: `AGENTS.md`, `CLAUDE.md`, `docs/architecture.md`, `docs/conventions.md`, `docs/tasks.md`, `mcp-include.txt`; the docs-links test | [04](./04-scaffold-docs-release.md) #2 | D02 | — |
 | ⬜ | T18 | T17 | Human docs: `README.md`, `API.md`; the api-docs and exports tests | [04](./04-scaffold-docs-release.md) #3 | D02 D22 | — |
-| ⬜ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 | — |
+| ⬜ | T19 | T18 | Durable Objects adapter (`./do`): both tiers, every conformance body run inside workerd | [02](./02-adapters.md) #7 | D05 D16 D24 D34 | — |
 | ⬜ | T20 | T19 | Archive this plan set; copy the backlog to `docs/backlog.md` | [04](./04-scaffold-docs-release.md) #4 | D22 | — |
 
 Row order is run order. T19 comes after the docs rows on purpose: if it blocks, the
-package is documented and releasable without `./do`. The release is not a row (D22).
+package is documented and releasable without `./do`. T33 comes before them, so they
+document it. The release is not a row (D22).
 
 ## Backlog (ranked, not scheduled)
 
@@ -91,6 +94,8 @@ package is documented and releasable without `./do`. The release is not a row (D
 D01–D08 are the owner's, from the interview of 2026-11-18. D09–D24 are the plan author's
 and are **open to veto until the row that cites them runs**: change one by editing its
 entry and the section it names. T12 is the scheduled moment to do that for the second half.
+T12 has run: D34 records what it confirmed and what it changed, and an entry above it that
+D34 changes says so where it stands.
 
 - **D01** (2026-11-18, owner) — Extract now, adopt later. sqlkit is a port and a
   generalization of the prior implementation's driver seam. Moving any existing package
@@ -209,7 +214,7 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      R2 promises a count for `SELECT`, a plain write and `RETURNING` only, and the `driver`
      body asserts nothing for DDL. F10 found the same on Durable Objects. T12 decides
      whether a non-write's `rowCount` is promised (a `total_changes()` delta would make it
-     0, at two extra statements per write).
+     0, at two extra statements per write). **Settled by D34.2: not promised.**
   2. The core derives `capabilities.crossProcessLock` from the backend having `lock`, and
      sets `concurrentWriters` false. Outside a transaction it calls `lock(name, false)`, and
      the release, in the connection's turn, after the in-process queue for that name:
@@ -256,6 +261,7 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      rejects with a `TypeError` naming `exec()`, after the statements ran. node:sqlite runs
      only the first statement of such a text, silently. T12 decides whether the contract
      says more (forcing the extended protocol on `pg` would refuse it before anything ran).
+     **Changed by D34.1: refused before any of it runs, on both (R11).**
   4. `close()` inside a transaction or an `exclusive` section rejects with a `TypeError`,
      as on the single-connection core (D27.4): `pool.end()` waits for the pinned
      connection, which is released only after the callback that awaits it.
@@ -273,7 +279,7 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
   1. A `TypeError` is never wrapped, from the driver or from a backend: D17 makes a
      programming mistake a `TypeError`, and a backend refuses with one of its own (T15's
      `pg.Client` backend will refuse a text of several statements, as the pool does,
-     through the core). Every other thrown value is wrapped, Node's own errors included:
+     through the core; since D34.1 the server refuses it first, on the extended protocol). Every other thrown value is wrapped, Node's own errors included:
      node:sqlite's `database is not open` and node-postgres's `Cannot use a pool after
      calling end` are `SqlError`s of kind `unknown`.
   2. The single-connection core tells a callback's error from the backend's by identity:
@@ -307,7 +313,7 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      `update`/`deleteFrom` match, which widens it (`deleteFrom("t", { tenant, id })` with
      `id` undefined deletes the tenant's rows). Kept as written, since a filter built from
      optional inputs wants it; the module comment says so. A match left with nothing is
-     still a `TypeError` (rule 2).
+     still a `TypeError` (rule 2). **Changed by D34.3 for `update` and `deleteFrom`.**
   2. "Empty" in rules 4 and 6, and for a fragment given as the table, is a fragment with no
      value and no text but whitespace, not `EMPTY` by identity: `raw("")`, `raw(" ")` and
      `and()` count.
@@ -347,11 +353,12 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      table names a number). A string is read as `Date` reads it, so a date and time with
      no offset is local time, which is how SQLite's `CURRENT_TIMESTAMP` writes UTC. Kept
      as written and stated in the module comment; T12 decides whether `instant` reads that
-     form as UTC.
+     form as UTC. **Changed by D34.4: it does.**
   5. `json` parses every string, so on `pg`, where a `json`/`jsonb` column arrives parsed,
      a column whose JSON value is itself a string is parsed a second time (`"12"` becomes
      `12`; `"hello"` is a `TypeError`). Stated in the module comment: it is for columns of
      objects and arrays. T12 decides whether a decoder should know the dialect.
+     **Confirmed by D34.5: it does not.**
   6. `decode` is frozen. The signatures keep the plan's inline
      `Row & { [K in keyof S]: ReturnType<S[K]> }`, with no named alias; `Decoder` is the
      one type exported beside the functions. The `decoders` body also round-trips a
@@ -395,9 +402,80 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
   8. `intervalMs` is above 0 and at most 2^31 − 1; the next check starts that long after
      the previous one settled, so checks never overlap. A check has no timeout of its
      own: one that never answers holds the monitor, bounded only by the driver's own
-     timeouts. T12 decides whether `checkHealth` takes a `timeoutMs`.
+     timeouts. T12 decides whether `checkHealth` takes a `timeoutMs`. **Changed by D34.6:
+     it does, in row T33.**
   9. The `driver` body has two health cases: a live driver is healthy, and a closed one is
      unhealthy with a `SqlError` of its dialect, the check still resolving.
+
+- **D34** (2026-11-18, T12; the owner delegated the review to the reviewing session) —
+  The API was used as a host would use it, by a script on node:sqlite and on Postgres:
+  `sql`, `ident`, `json`, `raw`, `query`, `exec`, a nested and a rolled-back
+  `transaction`, a read-only one, `exclusive`, `db.sync`, every builder, the decoders,
+  `withRetry` and `checkHealth`. `DO-FINDINGS.md` was read in full. **D09–D24 stand as
+  written, D24 included**: `nodejs_compat` alone gave `AsyncLocalStorage` and
+  `node:assert/strict` (F05, F06). D25–D33 stand except as changed here. The open points
+  they left, and the four `DO-FINDINGS.md` hands to T12, are settled as follows.
+  1. **R11: `query` runs one statement** (settles D29.3; changes what T05 and T07
+     built). The script showed node:sqlite run the first statement of a text and drop
+     the rest without a word, and the pool run them all, then refuse. Now a text of
+     several is refused before any of it runs. node:sqlite: the adapter reads what
+     follows the compiled statement's `sourceSQL`, and anything but blanks, `;` and
+     comments is a `TypeError`. `pg`: `query()` goes on the extended protocol
+     (`queryMode: "extended"`), with or without values, and the server refuses with
+     `42601` "cannot insert multiple commands into a prepared statement", a `SqlError`
+     of kind `unknown`; `CREATE INDEX CONCURRENTLY` and `VACUUM` still run that way.
+     `PgClientLike.query` takes a config object (`PgQueryConfigLike`, exported). The
+     `TypeError` after the fact stays only for a node-postgres that ignores
+     `queryMode`. The `driver` body gains an R11 case; T15 and T16 must pass it; T19
+     follows 02 #7.
+  2. **A non-write's `rowCount` is not promised** (settles D27.1). It is a number and
+     nothing more: no caller branches on what DDL counted, and a `total_changes()`
+     delta costs two statements per write. `QueryResult`'s doc says so.
+  3. **The match of `update` and `deleteFrom` refuses `undefined`** (changes D31.1). The
+     script's `deleteFrom("job", { tenant: "z", id })` with `id` undefined deleted every
+     row of the tenant, and a module comment was all that warned of it. Widening a write
+     loses data, so the match object of these two throws a `TypeError` naming the key.
+     `whereEq` still drops it, as a read's optional filter wants, and passing
+     `whereEq(match)` as the `where` is how a write says dropping is meant.
+  4. **`decode.instant` reads a date and time with no offset as UTC** (changes D32.4).
+     The script decoded SQLite's `current_timestamp` an hour early on a host in CET.
+     SQLite's date and time functions write UTC with no offset, so
+     `YYYY-MM-DD[ T]HH:MM[:SS[.fff…]]` is read as UTC; any other string as `Date` reads
+     it. Pinned in `test/unit/decode.test.ts` under a +05:45 zone, since CI's zone is
+     UTC and would hide it, and by a `decoders` case on a time the database wrote.
+  5. **`decode.json` stays blind to the dialect** (confirms D32.5). A `jsonb` value that
+     is itself a string is rare and stated; knowing the dialect would put it in every
+     spec.
+  6. **`checkHealth` takes a timeout** (settles D33.8), in new row T33, spec in
+     [03](./03-conventions.md) #6. A check that never answers left `last()` at the
+     previous status, healthy during an outage, and node-postgres's pool waits for a
+     connection without limit by default (`connectionTimeoutMillis` 0).
+  7. **Durable Objects, for T19** (the four points of `DO-FINDINGS.md`; 02 #7 has the
+     detail).
+     1. *Read-only* is enforced by detection, not refused: in a read-only transaction a
+        statement whose cursor reports `rowsWritten > 0` is a `ReadOnlyError`, and the
+        backend's transaction throws again after the callback, inside
+        `storage.transaction` or `transactionSync`, so the write rolls back whatever the
+        callback did with the error. The snapshot half of R7 holds by itself: an open
+        async transaction keeps every other request out (F14). If T19 finds a read (a
+        sort or a `group by` included) reporting rows written, `readOnly` is allowed
+        unenforced and R7's write case is listed under `except` with F12 as the reason.
+        Never a `TypeError`: it would fail correct portable code on one adapter.
+     2. *`bigint`*: the parameter rule is unchanged, since node:sqlite binds a 64-bit
+        `bigint` exactly. The Durable Objects backend turns one in the safe-integer
+        range into a number and refuses any other with a `TypeError` naming F09.
+     3. *Blobs* read back as a `Uint8Array` on every adapter. R10 says so from T12, and
+        a `driver` case holds node:sqlite and Postgres to it; node-postgres's `Buffer` is
+        a `Uint8Array` already. The Durable Objects backend wraps workerd's
+        `ArrayBuffer` in a view.
+     4. *Errors*: `classifySqlite` learns to read the extended code name from the
+        `(extended: SQLITE_…)` suffix, and to strip the `: SQLITE_…` tail before reading
+        the subject, when an error has no `errcode`. One classifier per dialect, not one
+        per adapter: `checkHealth` classifies by dialect alone.
+  8. **A correction to F12**: node:sqlite enforces foreign keys by default
+     (`DatabaseSync`'s `enableForeignKeyConstraints` is true; probed on Node 26.13.1),
+     so every adapter enforces them and F12's contrast with "node:sqlite's default
+     (off)" was wrong. D23 stands: `openSqlite` sets nothing more.
 
 ## How to resume (for a fresh conversation)
 

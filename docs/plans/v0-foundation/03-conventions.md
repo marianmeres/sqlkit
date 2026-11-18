@@ -27,6 +27,7 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
 | 3 | Retry and health, driven by `SqlError.retryable` | med | S | low |
 | 4 | SQL files as versions (Node only) | med | S | low |
 | 5 | Explicit row decoders | med | S | low |
+| 6 | A timeout on the health check (added at T12, D34.6) | med | S | low |
 
 ## Findings & recommendations (detailed)
 
@@ -79,7 +80,8 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
   Rules, each a test:
   1. A key whose value is `undefined` is left out; `null` binds `NULL` (and is `is null`
      in `whereEq`). A value that is an `Sql` is spliced, so `{ updated_at: raw("now()") }`
-     works.
+     works. Changed at T12 (D34.3): in the match object `update` and `deleteFrom` take, an
+     `undefined` value is a `TypeError`, since left out it would widen the write.
   2. Nothing left to write is a `TypeError`: an empty row, an empty patch, an empty
      `whereEq`, an empty `inList`.
   3. A multi-row `insert` takes its columns from the first row; a row with a different key
@@ -241,7 +243,7 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
 
   The monitor's timer never keeps a process alive (`timer.unref?.()`), `onChange` fires
   only when `healthy` flips (and once with the first status, `previous` `null`, D33), and
-  an `onChange` that throws is caught.
+  an `onChange` that throws is caught. #6 adds a timeout (T33).
 - **Done when** — `test/unit/retry.test.ts` passes: a retryable error is retried up to
   `retries` and then rethrown; a non-retryable one is rethrown at once; the delays follow
   `factor` and stop at `maxDelayMs`; an aborted signal ends the wait.
@@ -324,7 +326,7 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
   | Decoder | Accepts | Refuses with `TypeError` |
   |---------|---------|--------------------------|
   | `bool` | `true`/`false`, `1`/`0`, `1n`/`0n`, `"t"`/`"f"`, `"true"`/`"false"`, `"1"`/`"0"` | anything else |
-  | `instant` | a `Date`, a string `Date` can parse, a number of epoch milliseconds | an invalid date |
+  | `instant` | a `Date`, a string `Date` can parse (a date and time with no offset read as UTC, D34.4), a number of epoch milliseconds | an invalid date |
   | `json` | a string (parsed); anything else as it is | a string that is not JSON |
   | `bigint` | a `bigint`, an integer `number`, a string of digits with an optional sign | anything else |
   | `number` | a `number`, a `bigint` or numeric string that is finite and, if an integer, safe | anything else |
@@ -343,7 +345,63 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
   `timestamptz`, `jsonb` on `pg`; `integer`, `text`, `text` on `sqlite`); the adapter case
   exposes `driver.dialect` for that.
 
+### 6. A timeout on the health check
+
+- **Problem / observation** — A check has no timeout of its own (D33.8): one that never
+  answers stays pending, the monitor schedules nothing until it settles, and `last()`
+  keeps the previous status meanwhile. An outage that hangs rather than refuses, a
+  black-holed packet or a failover, therefore reads as healthy for as long as it lasts.
+  The driver's own timeouts do not cover the default case: node-postgres's pool waits for
+  a connection without limit (`connectionTimeoutMillis` 0), and a `Driver` has no cancel.
+- **Evidence** — `src/core/health.ts` (`check`, and the module comment's "A check has no
+  timeout of its own"); the T12 review (D34.6).
+- **Proposed change** — `src/core/health.ts`:
+
+  ```ts
+  export function checkHealth(
+  	db: Driver,
+  	options?: { timeoutMs?: number }, // 5_000
+  ): Promise<HealthStatus>;
+  export function createHealthMonitor(
+  	db: Driver,
+  	options?: {
+  		intervalMs?: number; // 30_000
+  		timeoutMs?: number; // 5_000
+  		onChange?: (status: HealthStatus, previous: HealthStatus | null) => void;
+  	},
+  ): HealthMonitor;
+  ```
+
+  - A check that has not settled `timeoutMs` after it was sent resolves unhealthy:
+    `latencyMs` `null`, `error` a `ConnectionError` of the driver's dialect (kind
+    `connection`, so `retryable`; no `code`, no `cause`) whose message names the timeout,
+    `checkedAt` when it was sent. Its `select 1` is abandoned, not cancelled; whatever it
+    answers later is dropped. The timer is cleared when the check settles first, and
+    never keeps a process alive.
+  - `timeoutMs` is checked as `intervalMs` is: a number above 0 and at most
+    2^31 − 1, anything else a `TypeError` at the call (`checkHealth` throws it at the
+    call too, as it does for a `db` that is not a driver; D33.5's "never rejects" holds).
+    An `options` that is not an object is a `TypeError`.
+  - The monitor: a timed-out check is reported at the timeout like any other status, and
+    the next check starts `intervalMs` after the previous one settled or timed out. An
+    abandoned check may therefore still be pending beside the next one; the module comment
+    says so, and that the driver's own timeouts are what end it.
+  - The module comment's paragraph on timeouts is rewritten to match.
+- **Done when** — `test/unit/health.test.ts` passes, under `mock.timers`, against stub
+  drivers: a `query` that never settles gives an unhealthy status with a
+  `ConnectionError` of the stub's dialect at `timeoutMs`, not before; a `query` that
+  settles after the timeout does not change the status already given; a `query` that
+  settles first clears the timer; a monitor over a stub that hangs once and then answers
+  reports unhealthy at the timeout, starts the next check `intervalMs` later and flips
+  back to healthy; each wrong `timeoutMs` is a `TypeError`. The `driver` body's two
+  health cases pass unchanged on every adapter.
+- **Affected files** — `src/core/health.ts`, `test/unit/health.test.ts`.
+- **Effort / Value / Risk** — S / med / low.
+- **Implementation notes** — Race the query against a timer inside `check`; do not add
+  a `Driver` method. Keep D33's rules otherwise: `onChange` with the first status and on
+  a flip, a check from a stopped run dropped, `last()` kept across `stop()`.
+
 ## Open questions / decisions needed
 
 None. D06 and D08 are the owner's; D18 and D19 are the plan author's calls, open to veto
-before T13 and T14 run.
+before T13 and T14 run. #6 was added by the T12 review (D34.6).

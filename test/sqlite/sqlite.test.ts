@@ -316,3 +316,47 @@ describe("sqlite/adapter: read-only transactions", () => {
 		});
 	});
 });
+
+describe("sqlite/adapter: one statement per query", () => {
+	// node:sqlite compiles a text's first statement and ignores the rest without a word;
+	// the adapter reads what follows it, so R11's refusal is its own, a TypeError.
+	const several = /holds more \(none of it ran\): a script goes through exec\(\)/;
+
+	test("a second statement is a TypeError on either tier, and none of it ran", async () => {
+		const db = openSqlite();
+		try {
+			await db.exec("create table t (id integer)");
+			await assert.rejects(
+				db.query("insert into t values (1); insert into t values (2)"),
+				(error) => error instanceof TypeError && several.test(error.message),
+			);
+			assert.throws(
+				() => db.sync?.query("insert into t values (3);\n/* c */ select 1"),
+				(error) => error instanceof TypeError && several.test(error.message),
+			);
+			assert.equal(await count(db), 0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	test("what follows may be blanks, semicolons and comments, however long", async () => {
+		const db = openSqlite();
+		try {
+			// A scan, not a backtracking pattern: a long run of dashes stays linear.
+			const dashes = "-".repeat(200_000);
+			const { rows } = await db.query(`select 1 as one; ${dashes}\n; /* x */ -- y`);
+			assert.deepEqual(rows, [{ one: 1 }]);
+			await assert.rejects(
+				db.query(`select 1 as one; ${dashes}\nselect 2`),
+				(error) => error instanceof TypeError && several.test(error.message),
+			);
+			// A block comment left open runs to the end of the text, as SQLite reads it.
+			assert.deepEqual((await db.query("select 1 as one; /* select 2")).rows, [
+				{ one: 1 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});

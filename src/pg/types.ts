@@ -30,13 +30,22 @@ export interface PgQueryResultLike {
 	command: string;
 }
 
-/**
- * One session a statement runs on: a `pg.PoolClient` a pool handed out, or a `pg.Client`.
- * Given no `values`, node-postgres sends the text as one simple query, which may hold
- * several statements; given values, as one parameterized statement.
- */
+/** One statement as node-postgres takes it: its text, its values, how it is sent. */
+export interface PgQueryConfigLike {
+	text: string;
+	values?: unknown[];
+	/**
+	 * `"extended"` sends the text as one parameterized statement even with no values, so
+	 * the server refuses a text of several before running any of it. Left unset with no
+	 * values, node-postgres sends a simple query, which runs every statement it holds. A
+	 * node-postgres that predates the option ignores it.
+	 */
+	queryMode?: "extended";
+}
+
+/** One session a statement runs on: a `pg.PoolClient` a pool handed out, or a `pg.Client`. */
 export interface PgClientLike {
-	query(text: string, values?: unknown[]): Promise<PgQueryResultLike>;
+	query(config: PgQueryConfigLike): Promise<PgQueryResultLike>;
 }
 
 /** A connection a pool handed out: a `pg.PoolClient`, or anything shaped like one. */

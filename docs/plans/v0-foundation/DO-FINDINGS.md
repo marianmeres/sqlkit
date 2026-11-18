@@ -24,7 +24,10 @@ through the async transaction (F05), and the conformance bodies can assert insid
 **D24 holds as far as T04 can tell:** `nodejs_compat` alone, on a 2026 compatibility date,
 provides `node:async_hooks` and `node:assert/strict`. No other flag was needed.
 
-**For T12** (decisions this spike feeds; none is taken here):
+**For T12** (decisions this spike feeds; none is taken here; T12 took all four, D34.7 in
+`PROGRESS.md`, detail in 02 #7: read-only enforced by `rowsWritten` detection, a `bigint`
+in the safe range bound as a number, blobs read back as a `Uint8Array`, and
+`classifySqlite` reading the code from the message):
 
 1. **Read-only transactions** (02, open questions): `PRAGMA query_only` is not authorized
    (F12), so R7's "refuses a write" cannot be enforced the way node:sqlite does it. The
@@ -203,8 +206,9 @@ classifier does. See point 4 for T12.
   `not authorized: SQLITE_AUTH`, and a write after the attempt succeeds.
 
 Consequence: a read-only transaction cannot be enforced with `query_only` here; point 1 for
-T12. Foreign-key behaviour differs from node:sqlite's default (off) and cannot be switched
-off on this adapter.
+T12. Foreign keys cannot be switched off on this adapter. (Corrected at T12, D34.8: this
+first said node:sqlite's default is off. It is on: `DatabaseSync` enforces foreign keys
+unless opened with `enableForeignKeyConstraints: false`, so every adapter enforces them.)
 
 ### F13 — P7: `sqlite_version()`, `RETURNING`, `ON CONFLICT`
 

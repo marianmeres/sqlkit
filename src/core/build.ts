@@ -13,9 +13,11 @@
  *
  * The rules, the same in every builder:
  *
- * 1. A key whose value is `undefined` is left out, from a row, a patch and a match alike.
- *    `null` binds `NULL`, and in a match reads `is null`. A value that is a fragment is
- *    spliced, so `{ updated_at: raw("now()") }` writes the expression.
+ * 1. A key whose value is `undefined` is left out of a row, a patch and a `whereEq`. In the
+ *    match object `update` and `deleteFrom` take it is a `TypeError`: left out there, it
+ *    would widen a write. `null` binds `NULL`, and in a match reads `is null`. A value
+ *    that is a fragment is spliced, so `{ updated_at: raw("now()") }` writes the
+ *    expression.
  * 2. Nothing left to write is a `TypeError`: an empty row, an empty patch, an empty match,
  *    an empty `inList`.
  * 3. A multi-row `insert` takes its columns from the first row; a row whose key set differs
@@ -28,9 +30,11 @@
  *    left they are `EMPTY`.
  * 7. Every identifier goes through `ident`; every value is bound.
  *
- * A match drops an `undefined` key as a row does, which suits a filter built from optional
- * inputs, and widens it: `deleteFrom("t", { tenant, id })` with `id` undefined deletes
- * every row of the tenant. Check an input that must be there before it reaches a match.
+ * `whereEq` drops an `undefined` key as a row does, which suits a filter built from
+ * optional inputs, and widens it. A write is where widening costs data:
+ * `deleteFrom("t", { tenant, id })` with `id` undefined would delete every row of the
+ * tenant, so the match object of `update` and `deleteFrom` refuses an `undefined` value.
+ * Passing `whereEq(match)` instead says that dropping it is meant.
  *
  * The statements are the subset both dialects share: `INSERT … VALUES`, `ON CONFLICT`,
  * `RETURNING`. There is no `select` builder: a query is what the `sql` tag is for.
@@ -126,6 +130,18 @@ function whereOf(who: string, where: unknown): Sql {
 			`${who}: a where is required; spell touching every row raw("true")`,
 		);
 	}
+	// Here an `undefined` key would widen a write, not a read: refused, not left out.
+	if (typeof where === "object" && where !== null && !Array.isArray(where)) {
+		for (const [column, value] of Object.entries(where)) {
+			if (value === undefined) {
+				throw new TypeError(
+					`${who}: the match's ${JSON.stringify(column)} is undefined; left out, it ` +
+						"would widen the write to every row the other keys match. Check the " +
+						"input, or pass whereEq(match) to leave it out on purpose",
+				);
+			}
+		}
+	}
 	return equalities(who, where);
 }
 
@@ -193,7 +209,8 @@ export function insert(
 
 /**
  * `update "t" set "a" = $1 where …`. `where` is a fragment, or a match read as
- * {@link whereEq} reads it. It is required: touching every row is spelled `raw("true")`.
+ * {@link whereEq} reads it but for an `undefined` value, which is a `TypeError`. It is
+ * required: touching every row is spelled `raw("true")`.
  */
 export function update(
 	table: TableRef,
@@ -260,7 +277,8 @@ export function upsert(
 
 /**
  * `delete from "t" where …`. `where` is a fragment, or a match read as {@link whereEq}
- * reads it. It is required: deleting every row is spelled `raw("true")`.
+ * reads it but for an `undefined` value, which is a `TypeError`. It is required: deleting
+ * every row is spelled `raw("true")`.
  */
 export function deleteFrom(
 	table: TableRef,

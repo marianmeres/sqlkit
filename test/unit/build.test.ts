@@ -170,13 +170,13 @@ describe("unit/build: the statements", () => {
 });
 
 describe("unit/build: rule 1, undefined is left out, null binds NULL, a fragment is spliced", () => {
-	test("an undefined key is left out of a row, a patch and a match", () => {
+	test("an undefined key is left out of a row, a patch and a whereEq", () => {
 		renders(insert("t", { a: 1, b: undefined, c: 3 }), {
 			pg: 'insert into "t" ("a", "c") values ($1, $2)',
 			sqlite: 'insert into "t" ("a", "c") values (?, ?)',
 			params: [1, 3],
 		});
-		renders(update("t", { a: undefined, b: 2 }, { id: 1, x: undefined }), {
+		renders(update("t", { a: undefined, b: 2 }, { id: 1 }), {
 			pg: 'update "t" set "b" = $1 where "id" = $2',
 			sqlite: 'update "t" set "b" = ? where "id" = ?',
 			params: [2, 1],
@@ -185,6 +185,27 @@ describe("unit/build: rule 1, undefined is left out, null binds NULL, a fragment
 			pg: '"b" = $1',
 			sqlite: '"b" = ?',
 			params: [2],
+		});
+	});
+
+	test("an undefined key in the match of update or deleteFrom is a TypeError", () => {
+		// Left out, it would widen the write: every row of the tenant, not the one id.
+		const id: number | undefined = undefined;
+		assert.throws(
+			() => update("t", { a: 1 }, { tenant: "x", id }),
+			typeError(
+				/^update: the match's "id" is undefined; left out, it would widen the write/,
+			),
+		);
+		assert.throws(
+			() => deleteFrom("t", { tenant: "x", id }),
+			typeError(/^deleteFrom: the match's "id" is undefined; .*whereEq\(match\)/),
+		);
+		// whereEq is how dropping it is said on purpose.
+		renders(deleteFrom("t", whereEq({ tenant: "x", id })), {
+			pg: 'delete from "t" where "tenant" = $1',
+			sqlite: 'delete from "t" where "tenant" = ?',
+			params: ["x"],
 		});
 	});
 

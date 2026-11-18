@@ -1,4 +1,4 @@
-// The `driver` conformance body: the contract's rules R1–R10 (plan doc 01 #2), at least one
+// The `driver` conformance body: the contract's rules R1–R11 (plan doc 01 #2), at least one
 // case per rule, and `checkHealth` on a live and on a closed driver (plan doc 03 #3), on
 // every registered adapter (plan doc 02 #2). Ported from the prior
 // implementation's driver conformance file
@@ -582,6 +582,36 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 		assert.equal(await count(db, "exec-stranger"), 1);
 	});
 
+	// ── R11: one statement per query ────────────────────────────────────────────────
+
+	test("R11: query refuses a text of several statements, and none of it runs", async (db) => {
+		// node:sqlite would run the first and drop the rest; a simple query on Postgres
+		// would run them all. Refused before either: a TypeError where the adapter sees
+		// it, the database's own refusal where the database does.
+		const refused = (error: unknown) =>
+			error instanceof TypeError || error instanceof SqlError;
+		await assert.rejects(
+			promiseOf("query(two statements)", () =>
+				db.query(
+					"insert into t (id, name) values ('first', 'a'); insert into t (id, name) values ('second', 'b')",
+				),
+			),
+			refused,
+		);
+		await assert.rejects(
+			db.transaction((tx) =>
+				tx.query(
+					"insert into t (id, name) values ('in-tx', 'a');\n-- a comment\nselect 1",
+				),
+			),
+			refused,
+		);
+		assert.equal(await count(db), 0);
+		// What may follow the one statement: blanks, semicolons and comments.
+		const { rows } = await db.query("select 1 as one; ;\n-- done\n/* really */ ");
+		assert.deepEqual(rows, [{ one: 1 }]);
+	});
+
 	// ── R10: parameters and rows ────────────────────────────────────────────────────
 
 	test("R10: values bind by the parameter rule, the same on both dialects", async (db) => {
@@ -648,6 +678,22 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 			);
 			assert.deepEqual(rows, [{ same_instant: 1, a: [1, 2] }]);
 		}
+	});
+
+	test("R10: bytes bound as a Uint8Array read back as one", async (db) => {
+		// A `Buffer` (node-postgres) is a `Uint8Array`; an `ArrayBuffer` (workerd) is not.
+		const bytes = new Uint8Array([0, 1, 254, 255]);
+		const { rows } = await db.query<{ b: unknown }>(
+			db.dialect === "pg"
+				? sql`select cast(${bytes} as bytea) as b`
+				: sql`select ${bytes} as b`,
+		);
+		const read = rows[0]?.b;
+		assert.ok(
+			read instanceof Uint8Array,
+			`read back ${Object.prototype.toString.call(read)}`,
+		);
+		assert.deepEqual(Array.from(read), [0, 1, 254, 255]);
 	});
 
 	test("R10: rows are plain objects", async (db) => {

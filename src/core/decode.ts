@@ -18,7 +18,7 @@
  * | Decoder   | Accepts                                                                     |
  * | --------- | --------------------------------------------------------------------------- |
  * | `bool`    | `true`/`false`, `1`/`0`, `1n`/`0n`, `"t"`/`"f"`, `"true"`/`"false"`, `"1"`/`"0"` |
- * | `instant` | a valid `Date`, a string `Date` parses, a number of epoch milliseconds      |
+ * | `instant` | a valid `Date`, a string `Date` parses (no offset: UTC), epoch milliseconds |
  * | `json`    | a string, parsed as JSON; any other value as it is                          |
  * | `bigint`  | a `bigint`, an integer `number`, a string of digits with an optional sign   |
  * | `number`  | a `number`, `bigint` or decimal string that is finite and, if an integer, safe |
@@ -27,15 +27,17 @@
  * `TypeError` that names the column and the type it found. The value itself is not quoted:
  * it is data, and an error message is what reaches a log.
  *
- * Two things the decoders cannot tell, because they see a value and not its column type:
+ * `instant` reads a date and time with no offset as UTC (`2026-01-02 03:04:05`, with a
+ * space or a `T`, seconds and a fraction optional), where `Date` would read local time:
+ * that is how SQLite's `CURRENT_TIMESTAMP`, `datetime()` and `strftime()` write UTC. Any
+ * other string is read as `Date` reads it. A `Date` written through the parameter rule is
+ * ISO text with its `Z`, and reads back as it was. On `pg` node-postgres hands back a
+ * `Date` already, which is returned as it is.
  *
- * - `instant` reads a string as `Date` does. A date and time with no offset is local time,
- *   and that is how SQLite's `CURRENT_TIMESTAMP` writes UTC (`2026-01-02 03:04:05`). A
- *   `Date` written through the parameter rule is ISO text with its `Z`, and reads back as
- *   it was.
- * - `json` parses every string. On `pg` a `json` or `jsonb` column arrives parsed already,
- *   so a column whose JSON value is itself a string arrives as that string and is parsed a
- *   second time. It suits a column of objects or arrays, which is what it is for.
+ * One thing the decoders cannot tell, because they see a value and not its column type:
+ * `json` parses every string. On `pg` a `json` or `jsonb` column arrives parsed already, so
+ * a column whose JSON value is itself a string arrives as that string and is parsed a
+ * second time. It suits a column of objects or arrays, which is what it is for.
  *
  * `decodeRow` and `decodeRows` apply a spec, an object of column names to decoders, and
  * return new rows: a column the spec names is decoded, any other is left as it was. A
@@ -72,12 +74,24 @@ function bool(value: unknown, column: string): boolean | null {
 	throw refusal("bool", column, `${kindOf(value)}, not a boolean`);
 }
 
-/** A valid `Date` as it is; a string `Date` parses; a number of epoch milliseconds. */
+/**
+ * A date and time with no offset, as SQLite's date and time functions write it
+ * (`2026-01-02 03:04:05`, `2026-01-02T03:04:05.678`): read as UTC, as SQLite means it.
+ */
+const SQL_DATETIME = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)$/;
+
+/**
+ * A valid `Date` as it is; a string `Date` parses, but one with a date and time and no
+ * offset read as UTC; a number of epoch milliseconds.
+ */
 function instant(value: unknown, column: string): Date | null {
 	if (value === null || value === undefined) return null;
 	let date: Date;
 	if (value instanceof Date) date = value;
-	else if (typeof value === "string" || typeof value === "number") {
+	else if (typeof value === "string") {
+		const parts = SQL_DATETIME.exec(value);
+		date = new Date(parts === null ? value : `${parts[1]}T${parts[2]}Z`);
+	} else if (typeof value === "number") {
 		date = new Date(value);
 	} else {
 		throw refusal("instant", column, `${kindOf(value)}, not a date`);

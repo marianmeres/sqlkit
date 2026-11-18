@@ -16,5 +16,6 @@ export type {
 	PgDriverOptions,
 	PgPoolClientLike,
 	PgPoolLike,
+	PgQueryConfigLike,
 	PgQueryResultLike,
 } from "./types.ts";

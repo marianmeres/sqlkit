@@ -347,7 +347,9 @@ no adapter imports a driver library, not even its types.
   export function createPgClientDriver(client: PgClientLike, options?: PgDriverOptions): Driver;
   ```
 
-  `src/pg/client.ts` is a `SingleConnectionBackend`: `run` and `exec` are `client.query`;
+  `src/pg/client.ts` is a `SingleConnectionBackend`: `run` and `exec` are `client.query`,
+  `run` on the extended protocol as the pool's `query()` is (`queryMode: "extended"`, so
+  R11 holds by the server's refusal, D34.1) and `exec` as a simple query;
   `transaction` is `begin` (or `begin isolation level repeatable read, read only`),
   `commit`, `rollback`; `lock` takes the same advisory lock keys as the pool driver, as a
   session lock outside a transaction and a transaction-scoped one inside, polled either
@@ -392,7 +394,10 @@ no adapter imports a driver library, not even its types.
   read-only transaction issues `set transaction isolation level repeatable read, read
   only` as its first statement; `classify` is `classifyPg`. Capabilities:
   `{ sync: false, concurrentWriters: false, crossProcessLock: false }`. The registry gains
-  a `pglite` adapter, one in-memory instance per case.
+  a `pglite` adapter, one in-memory instance per case. R11 (D34.1): `run` is PGlite's
+  `query`, which is expected to send one statement on the extended protocol, so a text
+  of several is refused by the server before any of it runs; check it, and if PGlite
+  runs such a text, return `blocked` with what it did rather than build a parser.
 - **Done when** — every conformance body registered so far (driver, errors, builders,
   decoders, migrate) passes on `pglite`; `test/pglite/pglite.test.ts` passes for the
   error classes of the four constraint violations raised for real, and for
@@ -423,8 +428,40 @@ no adapter imports a driver library, not even its types.
   async tier is the single-connection core over `storage.transaction`. Parameters, the
   affected-row count and the classifier follow F-entries P3, P4 and P5. `close()` does
   nothing. Capabilities: `{ sync: true, concurrentWriters: false, crossProcessLock: false }`.
-  Read-only transactions do what the review of T12 decided from P6. The adapter requires
-  the `nodejs_compat` flag (D24).
+  The adapter requires the `nodejs_compat` flag (D24, confirmed at T12).
+
+  What the T12 review decided from `DO-FINDINGS.md` (D34.7):
+
+  - **Read-only transactions are enforced by detection** (F12: `query_only` is not
+    authorized). Inside a read-only transaction, on either tier, a statement whose cursor
+    reports `rowsWritten > 0` (read right after `sql.exec`, F10) throws a
+    `ReadOnlyError` (kind `read_only`, no code). The backend remembers it, and its
+    transaction throws a `ReadOnlyError` again once the callback has returned, still
+    inside `storage.transaction` or `transactionSync`, so the write rolls back even when
+    the callback caught the first one. Check first that a read reports no rows written:
+    a plain `select`, one with `order by` over an unindexed column, one with `group by`.
+    If one does, allow `readOnly` unenforced instead, and list R7's write case under
+    `except` with F12 as its reason. Never refuse `readOnly: true` with a `TypeError`:
+    portable code that is correct would fail on this adapter alone. The snapshot half of
+    R7 holds by itself: an open async transaction keeps every other request out (F14),
+    and a sync one is synchronous.
+  - **`bigint` parameters** (F09: workerd refuses every one). The parameter rule is
+    unchanged; after it, the backend turns a `bigint` in the safe-integer range into a
+    number and refuses any other with a `TypeError` naming F09.
+  - **Blobs read back as a `Uint8Array`** (F09: workerd hands back an `ArrayBuffer`). The
+    backend wraps each `ArrayBuffer` in a row in a `Uint8Array` view. R10's doc comment in
+    `src/core/contract.ts` says so since T12, and the `driver` body's case "R10: bytes
+    bound as a Uint8Array read back as one" asserts it on every adapter.
+  - **Errors are read from the message** (F11: no code field). `classifySqlite` gains a
+    fallback for an error with no numeric `errcode`: the extended code name in the
+    `(extended: SQLITE_…)` suffix (or the primary one in a bare `: SQLITE_…` tail) picks
+    the kind, and that tail is stripped before the subject is read as it is today. One
+    classifier per dialect, not one per adapter: `checkHealth` classifies a rejection by
+    the driver's dialect alone. `test/unit/classify.test.ts` gains F11's five messages.
+  - **R11** (D34.1). F01: `sql.exec` with no bindings runs every statement of a text. If
+    the backend finds a way to refuse a text of several before any of it runs, use it; if
+    not, list R11's case under `except` with F01 as its reason. Do not split or parse SQL
+    to get there.
 
   The conformance bodies run inside workerd: `test/do/worker/conformance.ts` is a Durable
   Object that collects the cases of a named body into an in-memory `Suite`, runs them
@@ -448,6 +485,5 @@ no adapter imports a driver library, not even its types.
 
 ## Open questions / decisions needed
 
-None before T04. T12 decides, from `DO-FINDINGS.md`: what a read-only transaction does on
-Durable Objects when P6 shows it cannot be enforced (refuse with `TypeError`, or allow it
-unenforced), and whether D24 stands.
+None. T12 settled what T04 left open (D34): D24 stands, and a read-only transaction on
+Durable Objects is enforced by detection, or allowed unenforced if detection fails (#7).
