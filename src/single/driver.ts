@@ -33,6 +33,13 @@
  * statement reject, as on any other adapter, even when the engine underneath is
  * synchronous.
  *
+ * **Errors are typed here, at the boundary (D07).** Whatever the backend throws, on either
+ * tier, from a statement, a script, the opening or the end of a transaction, a lock or
+ * `close`, comes out as a `SqlError` of the kind the backend's classifier reads, with the
+ * backend's error as `cause`. Two things come out as they were thrown: what a transaction's
+ * or a section's callback threw, which is the caller's own, and a `TypeError`, which is a
+ * programming mistake and never a `SqlError` (D17).
+ *
  * **The sync tier.** Given a `SyncBackend` too, the driver has `sync`: the same connection,
  * answering at once, with a transaction whose callback is synchronous. The two tiers share
  * the connection, so each refuses what would land in the wrong transaction (D16):
@@ -72,9 +79,15 @@ import {
 	statementOf,
 	type TransactionOptions,
 } from "../core/contract.ts";
+import { toSqlError } from "../core/errors.ts";
 import { normalizeParams } from "../core/params.ts";
 import type { Sql } from "../core/sql.ts";
-import type { Connection, SingleConnectionBackend, SyncBackend } from "./backend.ts";
+import type {
+	Connection,
+	MaybePromise,
+	SingleConnectionBackend,
+	SyncBackend,
+} from "./backend.ts";
 
 /**
  * The transaction a context belongs to. One object per transaction, shared by every
@@ -96,6 +109,11 @@ interface Holding {
 	readonly parent: Holding | undefined;
 }
 
+/** What a callback threw, boxed, so that even a thrown `undefined` is told from none. */
+interface Thrown {
+	readonly error: unknown;
+}
+
 const settled = (): undefined => undefined;
 
 /**
@@ -107,7 +125,52 @@ export function createSingleConnectionDriver(
 	syncBackend?: SyncBackend,
 ): Driver {
 	const dialect = backend.dialect;
-	const lock = backend.lock?.bind(backend);
+	const classify = backend.classify.bind(backend);
+
+	/**
+	 * What the backend threw, as the contract has it: a `SqlError` of its kind, with the
+	 * backend's error as `cause` (D07). A `TypeError` is a programming mistake and stays one.
+	 */
+	const wrap = (error: unknown): unknown =>
+		error instanceof TypeError ? error : toSqlError(error, dialect, classify);
+
+	/** The one way into the backend: what `call` throws or rejects with is wrapped. */
+	const guard = async <T>(call: () => MaybePromise<T>): Promise<T> => {
+		try {
+			return await call();
+		} catch (error) {
+			throw wrap(error);
+		}
+	};
+
+	/** The same, for the sync tier: the backend answers at once, or throws. */
+	const guardSync = <T>(call: () => T): T => {
+		try {
+			return call();
+		} catch (error) {
+			throw wrap(error);
+		}
+	};
+
+	/**
+	 * What a backend's `transaction` threw: the callback's own error as it was thrown,
+	 * anything else (a failed `BEGIN` or `COMMIT`) wrapped.
+	 */
+	const fromTransaction = (error: unknown, thrown: Thrown | undefined): unknown =>
+		thrown !== undefined && error === thrown.error ? error : wrap(error);
+
+	const backendLock = backend.lock?.bind(backend);
+	/** The backend's lock, its taking and its release both guarded. */
+	const lock =
+		backendLock === undefined
+			? undefined
+			: async (
+					name: string,
+					inTransaction: boolean,
+				): Promise<() => Promise<void>> => {
+					const free = await guard(() => backendLock(name, inTransaction));
+					return () => guard(free);
+				};
 	const capabilities: Capabilities = Object.freeze({
 		sync: syncBackend !== undefined,
 		concurrentWriters: false,
@@ -153,15 +216,14 @@ export function createSingleConnectionDriver(
 		}
 	};
 
-	const runOn = async (
+	const runOn = (
 		connection: Connection,
 		text: string,
 		params: readonly unknown[],
-	): Promise<QueryResult<Row>> => connection.run(text, params);
+	): Promise<QueryResult<Row>> => guard(() => connection.run(text, params));
 
-	const execOn = async (connection: Connection, script: string): Promise<void> => {
-		await connection.exec(script);
-	};
+	const execOn = (connection: Connection, script: string): Promise<void> =>
+		guard(() => connection.exec(script));
 
 	/** The text and the bound values of one statement; a `TypeError` when refused. */
 	const prepare = (
@@ -226,17 +288,23 @@ export function createSingleConnectionDriver(
 			// Open for the sync tier until the backend is done, not until `fn` is: between
 			// the two the connection is still inside the transaction (S4).
 			asyncOpen = true;
+			let thrown: Thrown | undefined;
 			try {
 				return await backend.transaction(async (connection) => {
 					const tx: OpenTransaction = { open: true, connection };
 					try {
 						return await current.run(tx, () => invoke(fn));
+					} catch (error) {
+						thrown = { error };
+						throw error;
 					} finally {
 						// Before the backend commits or rolls back: whatever the callback
 						// left running is a stranger from here on, and queues like one.
 						tx.open = false;
 					}
 				}, readOnly);
+			} catch (error) {
+				throw fromTransaction(error, thrown);
 			} finally {
 				asyncOpen = false;
 			}
@@ -339,9 +407,7 @@ export function createSingleConnectionDriver(
 				new TypeError("close() cannot be called inside a transaction"),
 			);
 		}
-		closing = enqueue(async () => {
-			await backend.close();
-		});
+		closing = enqueue(() => guard(() => backend.close()));
 		return closing;
 	};
 
@@ -395,7 +461,7 @@ export function createSingleConnectionDriver(
 			): QueryResult<T> {
 				const { text, values } = prepare(statement, params);
 				assertSyncTurn("query()");
-				return engine.run(text, values) as QueryResult<T>;
+				return guardSync(() => engine.run(text, values)) as QueryResult<T>;
 			},
 			exec(script: string): void {
 				if (typeof script !== "string") {
@@ -404,7 +470,7 @@ export function createSingleConnectionDriver(
 					);
 				}
 				assertSyncTurn("exec()");
-				engine.exec(script);
+				guardSync(() => engine.exec(script));
 			},
 			transaction<T>(fn: (tx: SyncDriver) => T, options?: TransactionOptions): T {
 				const readOnly = readOnlyOf(options);
@@ -413,7 +479,19 @@ export function createSingleConnectionDriver(
 				// Nested (S2), or inside an async transaction's own context (S3): the open
 				// transaction is the transaction, as it was opened.
 				if (syncDepth > 0 || openTransaction() !== undefined) return run(fn);
-				return engine.transaction(() => run(fn), readOnly);
+				let thrown: Thrown | undefined;
+				try {
+					return engine.transaction(() => {
+						try {
+							return run(fn);
+						} catch (error) {
+							thrown = { error };
+							throw error;
+						}
+					}, readOnly);
+				} catch (error) {
+					throw fromTransaction(error, thrown);
+				}
 			},
 		};
 		return tier;

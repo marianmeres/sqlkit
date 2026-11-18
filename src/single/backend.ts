@@ -67,7 +67,12 @@ export interface SingleConnectionBackend extends Connection {
 	 * else runs on the connection until each has settled.
 	 */
 	lock?(name: string, inTransaction: boolean): Promise<() => Promise<void>>;
-	/** Which kind of error a driver error is: the dialect's classifier. */
+	/**
+	 * Which kind of error a driver error is: the dialect's classifier. The core wraps
+	 * whatever the backend throws with it, on both tiers (D07), so a backend throws its
+	 * driver's errors as they are. A `TypeError` it throws is a refusal of its own and is
+	 * not wrapped.
+	 */
 	classify(error: unknown): SqlErrorInfo;
 	/** End the connection the adapter was given. The core calls it once. */
 	close(): MaybePromise<void>;

@@ -52,7 +52,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
 | ✅ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
 | ✅ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
-| ⬜ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
+| ✅ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
 | ⬜ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
 | ⬜ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | — |
 | ⬜ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | — |
@@ -267,6 +267,39 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
   6. The pg-only suites take a schema per case (D20), where the snapshot shared one per
      file; `test/_env.ts` requires `TEST_PG_DATABASE` only, and leaves an unset user or
      password to node-postgres's own defaults.
+
+- **D30** (2026-11-18, T08 session) — Found while wrapping errors at the boundary; open to
+  veto at T12 ([01](./01-core.md) #4).
+  1. A `TypeError` is never wrapped, from the driver or from a backend: D17 makes a
+     programming mistake a `TypeError`, and a backend refuses with one of its own (T15's
+     `pg.Client` backend will refuse a text of several statements, as the pool does,
+     through the core). Every other thrown value is wrapped, Node's own errors included:
+     node:sqlite's `database is not open` and node-postgres's `Cannot use a pool after
+     calling end` are `SqlError`s of kind `unknown`.
+  2. The single-connection core tells a callback's error from the backend's by identity:
+     what the callback threw (boxed, so a thrown `undefined` counts) comes out of
+     `backend.transaction` as it was; anything else from it (a failed `BEGIN` or
+     `COMMIT`) is wrapped. The core also wraps a backend lock's taking and release and
+     `close()`, pinned on a stub in `test/unit/single-backend.test.ts`. The pool adapter
+     needs no such test: its guard is around each node-postgres call (`send`,
+     `pool.connect`, `pool.end`), and a callback never runs inside one.
+  3. A `COMMIT` answered with `ROLLBACK` is a `TransactionAbortedError` with no `code` and
+     no `cause`: the server sent no error, only the command tag.
+  4. `openSqlite` wraps opening the file and setting WAL, node:sqlite's "connecting": a
+     file that cannot be opened is a `SqlError` of kind `unknown`, code `"14"`
+     (`SQLITE_CANTOPEN` has no kind of its own).
+  5. The `errors` body asserts 01 #3's field table exactly, a field the table does not
+     promise asserted absent, and checks `cause` by classifying it again. It sets up its
+     schema with `exec()`. T19 has to make it pass on Durable Objects, whose errors carry
+     no `errcode` (F11).
+  6. The pg-only deadlock case takes about one second: `deadlock_timeout` is
+     superuser-only, and the test role is not one. The suite also pins node-postgres's
+     real `timeout exceeded when trying to connect` against the classifier, on a pool of
+     one held by a transaction, and a lock refused by `lock_timeout` as `BusyError`.
+  7. The `catch` guard in `test/unit/core-imports.test.ts` reads code only (comments,
+     strings, templates and regular expressions blanked; one bare word in a string kept,
+     as `"code"` is how a read by name is spelled) and flags a property read, a read by
+     name and destructuring, in a `catch` clause or a `.catch(…)` call.
 
 ## How to resume (for a fresh conversation)
 

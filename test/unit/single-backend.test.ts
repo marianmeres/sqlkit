@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
+import { BusyError, SqlError, type SqlErrorInfo } from "../../src/mod.ts";
 import type {
 	Connection,
 	SingleConnectionBackend,
@@ -356,5 +357,207 @@ describe("unit/single-backend: the sync tier", () => {
 		await open;
 		sync.query("after");
 		assert.deepEqual(log, ["begin", "commit", "sync: after"]);
+	});
+});
+
+// ── typed errors (plan doc 01 #4) ───────────────────────────────────────────────────
+//
+// The core wraps what the backend throws, wherever it throws it. node:sqlite reaches the
+// statement, the script and a transaction's BEGIN and COMMIT, on both tiers (the `errors`
+// conformance body); no registered adapter yet has a lock whose taking or release can
+// fail, or a backend refusal of its own that is a `TypeError`. A backend that fails at a
+// chosen point pins those, and the classifier the core must use is the backend's.
+
+/** A driver's error, as the stub throws it: its classifier reads it as `busy`. */
+function driverError(where: string): Error {
+	return Object.assign(new Error(`driver failed at ${where}`), { stubBusy: true });
+}
+
+/** The stub's classifier: the core must ask the backend's, not pick one by dialect. */
+function classifyStub(error: unknown): SqlErrorInfo {
+	return (error as { stubBusy?: unknown } | null)?.stubBusy === true
+		? { kind: "busy", code: "STUB" }
+		: { kind: "unknown" };
+}
+
+/** Both tiers of a backend that throws a driver's error at `failAt`, and nowhere else. */
+function failing(failAt: string): SingleConnectionBackend & { sync: SyncBackend } {
+	const fail = (where: string): void => {
+		if (where === failAt) throw driverError(where);
+	};
+	const connection: Connection = {
+		async run() {
+			fail("run");
+			if (failAt === "refusal") throw new TypeError("the backend's own refusal");
+			return { rows: [], rowCount: 0 };
+		},
+		async exec() {
+			fail("exec");
+		},
+	};
+	return {
+		dialect: "sqlite",
+		adapter: "stub",
+		run: connection.run,
+		exec: connection.exec,
+		async transaction(fn) {
+			fail("begin");
+			const result = await fn(connection);
+			fail("commit");
+			return result;
+		},
+		async lock() {
+			fail("lock");
+			return async () => {
+				fail("release");
+			};
+		},
+		classify: classifyStub,
+		async close() {
+			fail("close");
+		},
+		sync: {
+			run() {
+				fail("sync run");
+				return { rows: [], rowCount: 0 };
+			},
+			exec() {
+				fail("sync exec");
+			},
+			transaction(fn) {
+				fail("sync begin");
+				const result = fn();
+				fail("sync commit");
+				return result;
+			},
+		},
+	};
+}
+
+/** `error` is the stub's driver error from `where`, wrapped by the backend's classifier. */
+function assertWrapped(error: unknown, where: string): void {
+	assert.ok(error instanceof BusyError, `${where}: ${String(error)}`);
+	assert.equal(error.dialect, "sqlite");
+	assert.equal(error.code, "STUB");
+	assert.equal(error.message, `driver failed at ${where}`);
+	assert.equal((error.cause as Error).message, `driver failed at ${where}`);
+	assert.ok(!(error.cause instanceof SqlError));
+}
+
+/** What `promise` rejected with; a fulfilment fails the case. */
+async function rejection(what: string, promise: Promise<unknown>): Promise<unknown> {
+	return promise.then(
+		() => assert.fail(`${what} was not refused`),
+		(error: unknown) => error,
+	);
+}
+
+/** What `call` threw; a return fails the case. */
+function thrown(what: string, call: () => unknown): unknown {
+	try {
+		call();
+	} catch (error) {
+		return error;
+	}
+	return assert.fail(`${what} was not refused`);
+}
+
+describe("unit/single-backend: typed errors", () => {
+	test("whatever the backend throws, wherever, is wrapped by the backend's classifier", async () => {
+		const cases: [
+			string,
+			(db: ReturnType<typeof createSingleConnectionDriver>) => Promise<unknown>,
+		][] = [
+			["run", (db) => db.query("x")],
+			["run", (db) => db.transaction((tx) => tx.query("x"))],
+			["exec", (db) => db.exec("x")],
+			[
+				"begin",
+				(db) => db.transaction(async () => assert.fail("the callback ran")),
+			],
+			["commit", (db) => db.transaction(async () => "done")],
+			[
+				"lock",
+				(db) => db.exclusive("job", async () => assert.fail("the callback ran")),
+			],
+			[
+				"lock",
+				(db) => db.transaction((tx) => tx.exclusive("job", async () => "done")),
+			],
+			["release", (db) => db.exclusive("job", async () => "done")],
+			["close", (db) => db.close()],
+		];
+		for (const [where, call] of cases) {
+			const backend = failing(where);
+			const db = createSingleConnectionDriver(backend, backend.sync);
+			assertWrapped(await rejection(where, call(db)), where);
+		}
+	});
+
+	test("the sync tier wraps the same way, and throws at the call", () => {
+		const cases: [
+			string,
+			(
+				sync: NonNullable<
+					ReturnType<typeof createSingleConnectionDriver>["sync"]
+				>,
+			) => unknown,
+		][] = [
+			["sync run", (sync) => sync.query("x")],
+			["sync run", (sync) => sync.transaction((tx) => tx.query("x"))],
+			["sync exec", (sync) => sync.exec("x")],
+			[
+				"sync begin",
+				(sync) => sync.transaction(() => assert.fail("the callback ran")),
+			],
+			["sync commit", (sync) => sync.transaction(() => "done")],
+		];
+		for (const [where, call] of cases) {
+			const backend = failing(where);
+			const sync = createSingleConnectionDriver(backend, backend.sync).sync;
+			assert.ok(sync !== undefined);
+			assertWrapped(
+				thrown(where, () => call(sync)),
+				where,
+			);
+		}
+	});
+
+	test("a backend's TypeError and a callback's error, even a driver's, come out as thrown", async () => {
+		const refusing = failing("refusal");
+		const refused = await rejection(
+			"a refusal",
+			createSingleConnectionDriver(refusing).query("x"),
+		);
+		assert.ok(refused instanceof TypeError && !(refused instanceof SqlError));
+		assert.equal(refused.message, "the backend's own refusal");
+
+		const backend = failing("nowhere");
+		const db = createSingleConnectionDriver(backend, backend.sync);
+		const sync = db.sync;
+		assert.ok(sync !== undefined);
+		// Shaped so that the backend's classifier would read it as `busy`.
+		const own = driverError("the callback");
+		for (const [what, call] of [
+			["transaction", () => db.transaction(async () => Promise.reject(own))],
+			["exclusive", () => db.exclusive("job", async () => Promise.reject(own))],
+			[
+				"exclusive inside a transaction",
+				() =>
+					db.transaction((tx) =>
+						tx.exclusive("job", async () => Promise.reject(own)),
+					),
+			],
+		] as const) {
+			assert.equal(await rejection(what, call()), own, what);
+		}
+		assert.equal(
+			thrown("sync.transaction", () =>
+				sync.transaction(() => {
+					throw own;
+				}),
+			),
+			own,
+		);
 	});
 });

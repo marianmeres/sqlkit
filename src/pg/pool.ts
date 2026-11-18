@@ -39,9 +39,16 @@
  *
  * `COMMIT` is checked, not trusted: Postgres answers the `COMMIT` of a transaction a failed
  * statement aborted with `ROLLBACK`, and no error. A callback that caught that statement's
- * error and returned normally would otherwise be reported as committed. A `ROLLBACK` that
- * failed leaves the connection in a state nobody knows, so it is destroyed, not handed
- * back to the pool.
+ * error and returned normally would otherwise be reported as committed; it rejects with
+ * `TransactionAbortedError` instead. A `ROLLBACK` that failed leaves the connection in a
+ * state nobody knows, so it is destroyed, not handed back to the pool.
+ *
+ * **Errors are typed at the boundary (D07).** Every call into node-postgres goes through one
+ * guard (`guard`): checking a connection out, every statement (the caller's, `BEGIN`,
+ * `COMMIT`, the lock polls, `set search_path`) and ending the pool. What it throws comes out
+ * as a `SqlError` of the kind `classifyPg` reads, with node-postgres's error as `cause`.
+ * What a callback threw comes out as it was thrown, and a `TypeError` stays one: a
+ * programming mistake is never a `SqlError` (D17).
  *
  * The pool's `error` event (an idle client the server dropped) is listened to, because a
  * pool nobody listens to ends the process on the first one. When the host listens too,
@@ -54,6 +61,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as sleep } from "node:timers/promises";
+import { classifyPg } from "../core/classify-pg.ts";
 import {
 	assertLockName,
 	type Capabilities,
@@ -64,6 +72,7 @@ import {
 	statementOf,
 	type TransactionOptions,
 } from "../core/contract.ts";
+import { TransactionAbortedError, toSqlError } from "../core/errors.ts";
 import { normalizeParams } from "../core/params.ts";
 import { quoteIdent, type Sql } from "../core/sql.ts";
 import type {
@@ -71,6 +80,7 @@ import type {
 	PgDriverOptions,
 	PgPoolClientLike,
 	PgPoolLike,
+	PgQueryResultLike,
 } from "./types.ts";
 
 /**
@@ -106,12 +116,48 @@ type LockKey = readonly [number, number];
 
 const settled = (): undefined => undefined;
 
-/** What a `COMMIT` that did not commit is refused with. */
-function notCommitted(command: string): Error {
-	return new Error(
+/**
+ * What a `COMMIT` that did not commit is refused with. The server sent no error, so there
+ * is no `code` and no `cause`: only the command tag said so.
+ */
+function notCommitted(command: string): TransactionAbortedError {
+	return new TransactionAbortedError(
 		`postgres answered COMMIT with ${command}: a statement inside the transaction ` +
 			"failed, so nothing was committed; the callback caught that statement's error " +
 			"and returned as if it had succeeded",
+		"pg",
+		{ kind: "aborted" },
+	);
+}
+
+/**
+ * What node-postgres threw, as the contract has it: a `SqlError` of its kind, with the
+ * driver's error as `cause` (D07). A `TypeError` is a programming mistake and stays one.
+ */
+function wrap(error: unknown): unknown {
+	return error instanceof TypeError ? error : toSqlError(error, "pg", classifyPg);
+}
+
+/** The one way into node-postgres: what `call` throws or rejects with is wrapped. */
+async function guard<T>(call: () => Promise<T>): Promise<T> {
+	try {
+		return await call();
+	} catch (error) {
+		throw wrap(error);
+	}
+}
+
+/**
+ * One statement on `client`, guarded. Without `values` node-postgres sends a simple query,
+ * which may hold several statements; with them, even none, one statement.
+ */
+function send(
+	client: PgClientLike,
+	text: string,
+	values?: unknown[],
+): Promise<PgQueryResultLike> {
+	return guard(() =>
+		values === undefined ? client.query(text) : client.query(text, values),
 	);
 }
 
@@ -151,11 +197,11 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 	const configured = new WeakSet<PgPoolClientLike>();
 
 	const acquire = async (): Promise<PgPoolClientLike> => {
-		const client = await pool.connect();
+		const client = await guard(() => pool.connect());
 		if (setSearchPath !== undefined && !configured.has(client)) {
 			try {
 				// Outside any transaction, so a later ROLLBACK cannot undo it.
-				await client.query(setSearchPath);
+				await send(client, setSearchPath);
 			} catch (error) {
 				client.release(error as Error);
 				throw error;
@@ -179,7 +225,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		text: string,
 		values: unknown[],
 	): Promise<QueryResult<T>> => {
-		const result = await client.query(text, values);
+		const result = await send(client, text, values);
 		// Without parameters node-postgres sends a simple query, which runs every
 		// statement of the text and answers one result each.
 		if (Array.isArray(result)) {
@@ -256,13 +302,13 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 			throw new TypeError(`exec(script) takes SQL text, got ${describe(script)}`);
 		}
 		// No parameters: one simple query, which may hold any number of statements.
-		const send = async (client: PgClientLike): Promise<void> => {
-			await client.query(script);
+		const runScript = async (client: PgClientLike): Promise<void> => {
+			await send(client, script);
 		};
 		const pin = currentPin();
-		if (pin?.kind === "transaction") return send(pin.client);
-		if (pin !== undefined) return onTurn(pin, () => send(pin.client));
-		return onOwnClient(send);
+		if (pin?.kind === "transaction") return runScript(pin.client);
+		if (pin !== undefined) return onTurn(pin, () => runScript(pin.client));
+		return onOwnClient(runScript);
 	};
 
 	/**
@@ -288,7 +334,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		// Set once the server has ended the transaction itself: no ROLLBACK to send.
 		let ended = false;
 		try {
-			await client.query(readOnly ? BEGIN_READ_ONLY : "begin");
+			await send(client, readOnly ? BEGIN_READ_ONLY : "begin");
 			try {
 				let result: T;
 				try {
@@ -298,7 +344,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 					// a connection of its own from here on.
 					tx.open = false;
 				}
-				const { command } = await client.query("commit");
+				const { command } = await send(client, "commit");
 				if (command !== "COMMIT") {
 					ended = true;
 					throw notCommitted(command);
@@ -307,7 +353,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 			} catch (error) {
 				if (!ended) {
 					try {
-						await client.query("rollback");
+						await send(client, "rollback");
 					} catch (rollbackError) {
 						// Keep the original failure; a failed ROLLBACK is a symptom, not the
 						// cause. But the connection's state is now unknown: destroy it
@@ -353,7 +399,8 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 
 	/** The lock's two keys, computed once so a later `search_path` cannot move them. */
 	const lockKeyOf = async (client: PgClientLike, name: string): Promise<LockKey> => {
-		const { rows } = await client.query(
+		const { rows } = await send(
+			client,
 			"select hashtext($1) as a, hashtext(coalesce(current_schema(), '')) as b",
 			[name],
 		);
@@ -378,7 +425,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		let wait = LOCK_POLL_FIRST_MS;
 		for (;;) {
 			const { rows } = await turn(() =>
-				client.query(`select ${fn}($1, $2) as ok`, [...key]),
+				send(client, `select ${fn}($1, $2) as ok`, [...key]),
 			);
 			if (rows[0]?.ok === true) return;
 			await sleep(wait);
@@ -387,7 +434,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 	};
 
 	const unlock = async (client: PgClientLike, key: LockKey): Promise<void> => {
-		await client.query("select pg_advisory_unlock($1, $2)", [...key]);
+		await send(client, "select pg_advisory_unlock($1, $2)", [...key]);
 	};
 
 	const exclusive = async <T>(
@@ -477,9 +524,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 				),
 			);
 		}
-		closing = (async (): Promise<void> => {
-			await pool.end();
-		})();
+		closing = guard(() => pool.end());
 		return closing;
 	};
 

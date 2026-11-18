@@ -17,11 +17,18 @@
  *   closes it.
  * - `openSqlite(path, options)` opens one with the conventional settings (a busy timeout,
  *   WAL for a file) and hands it to `createSqliteDriver`.
+ *
+ * Errors are typed at the boundary (D07): what node:sqlite throws, from a statement, a
+ * transaction's `BEGIN` or `COMMIT`, or opening the file in `openSqlite`, comes out as a
+ * `SqlError` of the kind `classifySqlite` reads, with node:sqlite's error as `cause`. The
+ * single-connection core wraps everything the handle does once it is a driver; only
+ * opening it is wrapped here.
  */
 
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import { classifySqlite } from "../core/classify-sqlite.ts";
 import type { Driver, QueryResult, Row } from "../core/contract.ts";
+import { toSqlError } from "../core/errors.ts";
 import type {
 	Connection,
 	SingleConnectionBackend,
@@ -65,18 +72,36 @@ export function createSqliteDriver(db: DatabaseSync): Driver {
  * timeout (`options.busyTimeout`, 5000 ms by default) and, for a file, the WAL journal,
  * which lets readers on other connections read while one writes. `path` is `":memory:"`
  * by default.
+ *
+ * A file that cannot be opened, or a journal that cannot be switched, throws a `SqlError`
+ * with node:sqlite's error as `cause`; a path that is not one is a `TypeError`.
  */
 export function openSqlite(path = ":memory:", options?: OpenSqliteOptions): Driver {
 	const timeout = busyTimeoutOf(options?.busyTimeout);
-	const db = new DatabaseSync(path, { timeout });
+	let db: DatabaseSync;
+	try {
+		db = new DatabaseSync(path, { timeout });
+	} catch (error) {
+		throw wrap(error);
+	}
 	try {
 		// `location()` is null for a database that is not a file.
 		if (db.location() !== null) db.exec("PRAGMA journal_mode = WAL");
 		return createSqliteDriver(db);
 	} catch (error) {
 		db.close();
-		throw error;
+		throw wrap(error);
 	}
+}
+
+/**
+ * What node:sqlite threw, as the contract has it: a `SqlError` of its kind, with the
+ * driver's error as `cause` (D07). A `TypeError` is a programming mistake and stays one.
+ */
+function wrap(error: unknown): unknown {
+	return error instanceof TypeError
+		? error
+		: toSqlError(error, "sqlite", classifySqlite);
 }
 
 /** A whole number of milliseconds from 0, or a `TypeError` naming the option. */

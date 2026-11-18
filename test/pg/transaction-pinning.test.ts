@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { describe, test } from "node:test";
 import pg from "pg";
-import type { Driver } from "../../src/mod.ts";
+import { type Driver, TransactionAbortedError } from "../../src/mod.ts";
 import { createPgDriver } from "../../src/pg/mod.ts";
 import { testPgConfig } from "../_env.ts";
 import { createPgFixture, type PgFixture } from "./_fixture.ts";
@@ -166,7 +166,9 @@ describe("pg/transaction-pinning", () => {
 					await tx.query("insert into t (id) values ($1)", ["aborted-1"]);
 					await assert.rejects(tx.query("select * from no_such_table"));
 				}),
-				/answered COMMIT with ROLLBACK/,
+				(error) =>
+					error instanceof TransactionAbortedError &&
+					/answered COMMIT with ROLLBACK/.test(error.message),
 			);
 			assert.equal(await countRows(driver, "aborted-%"), 0);
 
