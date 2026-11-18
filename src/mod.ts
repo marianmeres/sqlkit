@@ -30,6 +30,7 @@ export {
 	statementOf,
 	type TransactionOptions,
 } from "./core/contract.ts";
+export { type Decoder, decode, decodeRow, decodeRows } from "./core/decode.ts";
 export {
 	BusyError,
 	CheckViolationError,

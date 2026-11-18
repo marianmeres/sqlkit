@@ -54,7 +54,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
 | ✅ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
 | ✅ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
-| ⬜ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | — |
+| ✅ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | — |
 | ⬜ | T11 | T10 | `withRetry`, `checkHealth`, `createHealthMonitor` | [03](./03-conventions.md) #3 | D08 D17 | — |
 | 🔒 | T12 | T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 | Owner review of the API and of `DO-FINDINGS.md`; D09–D24 confirmed or changed | [01](./01-core.md) #5 | D09 D10 D11 D14 D15 D16 D17 D24 | — |
 | ⬜ | T13 | T12 | Migrate wiring over a `Driver` (`./migrate`), its conformance body, the interop tests | [03](./03-conventions.md) #2 | D06 D18 D21 | — |
@@ -324,6 +324,40 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      the builders, since they appear in the builders' signatures.
   7. The `builders` body also runs the fragments through the sync tier on an adapter that
      has one, since the module comment promises both tiers.
+
+- **D32** (2026-11-18, T10 session) — Found while writing the decoders; open to veto at
+  T12 ([03](./03-conventions.md) #5).
+  1. `decodeRow` and `decodeRows` refuse a column the spec names that the row does not
+     have, with a `TypeError`, rather than letting the decoder read its `undefined` as
+     `null`: a driver hands back every column it selected, so a missing one is a spec that
+     does not match its query, and a misspelt name would otherwise decode to `null`
+     silently. The decoders themselves still read `undefined` as `null`, as the table says,
+     for use on one value. An inherited property is not a column.
+  2. A refusal names the column and the type it found, never the value: a column holds
+     data, and an error message is what reaches a log. So `json`'s refusal carries no
+     `cause`, since the parser's `SyntaxError` quotes the text. A decoder called without a
+     column name says "the value".
+  3. `number`'s numeric string is decimal text: digits with an optional sign, fraction and
+     exponent. Whitespace, hex, `"NaN"` and `"Infinity"` are refused (`Number()` alone
+     reads `""` as 0 and `"0x10"` as 16). A `bigint` outside ±(2^53−1) is refused with a
+     pointer to `decode.bigint`. `bigint`'s integer `number` need not be safe:
+     `BigInt(2 ** 60)` is exact for the number it is given. `bool` compares strictly and
+     case-sensitively.
+  4. `instant` returns a valid `Date` as it is, not a copy, and refuses a `bigint` (the
+     table names a number). A string is read as `Date` reads it, so a date and time with
+     no offset is local time, which is how SQLite's `CURRENT_TIMESTAMP` writes UTC. Kept
+     as written and stated in the module comment; T12 decides whether `instant` reads that
+     form as UTC.
+  5. `json` parses every string, so on `pg`, where a `json`/`jsonb` column arrives parsed,
+     a column whose JSON value is itself a string is parsed a second time (`"12"` becomes
+     `12`; `"hello"` is a `TypeError`). Stated in the module comment: it is for columns of
+     objects and arrays. T12 decides whether a decoder should know the dialect.
+  6. `decode` is frozen. The signatures keep the plan's inline
+     `Row & { [K in keyof S]: ReturnType<S[K]> }`, with no named alias; `Decoder` is the
+     one type exported beside the functions. The `decoders` body also round-trips a
+     `bigint` (`bigint` on `pg`, `integer` on `sqlite`) and a fraction (`numeric(10, 2)`,
+     `real`), pins on `sqlite` that the rows read back undecoded, and decodes rows from the
+     sync tier on an adapter that has one.
 
 ## How to resume (for a fresh conversation)
 

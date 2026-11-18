@@ -329,7 +329,8 @@ README), including @marianmeres/migrate 2.0.0. Planning artifact; no code was ch
   | `number` | a `number`, a `bigint` or numeric string that is finite and, if an integer, safe | anything else |
 
   Every decoder passes `null` and `undefined` through as `null`. A column not in the spec
-  is left alone. A refusal names the column and the type it found.
+  is left alone. A refusal names the column and the type it found. A column the spec names
+  that the row does not have is a `TypeError` (D32).
 - **Done when** — `test/unit/decode.test.ts` passes with a case per table cell;
   `test/conformance/decoders.ts` passes on every registered adapter: a boolean, a `Date`
   and a JSON object are written through the parameter rule (doc 01 #2), read back raw, and
