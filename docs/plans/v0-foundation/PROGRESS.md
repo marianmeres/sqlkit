@@ -51,7 +51,7 @@ runs of ten and eight fit the driver's defaults (`sprint -h` prints them). Rehea
 | ✅ | T04 | T03 | Durable Objects spike: workerd harness under `node:test`, assumptions A1–A6, probes P1–P8, `DO-FINDINGS.md` | [02](./02-adapters.md) #1 | D03 D05 D20 D24 | — |
 | ✅ | T05 | T04 | Single-connection driver core, the node:sqlite adapter (async tier), the runner-agnostic conformance harness and the `driver` body | [02](./02-adapters.md) #2 | D09 D12 D13 D15 D20 D23 | — |
 | ✅ | T06 | T05 | Sync tier on node:sqlite and the tier rules S1–S6; the `sync` conformance body | [02](./02-adapters.md) #3 | D03 D16 | — |
-| ⬜ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
+| ✅ | T07 | T06 | Postgres pool adapter: pinned transactions, `exclusive`, `schema`; the `pg` fixtures and pg-only suites | [02](./02-adapters.md) #4 | D09 D12 D13 D20 | — |
 | ⬜ | T08 | T07 | Typed errors end to end: adapters wrap at the boundary; the `errors` body and the adapter-specific error suites | [01](./01-core.md) #4 | D07 D17 | — |
 | ⬜ | T09 | T08 | Statement builders: `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` | [03](./03-conventions.md) #1 | D08 | — |
 | ⬜ | T10 | T09 | Explicit row decoders: `decode.*`, `decodeRow`, `decodeRows` | [03](./03-conventions.md) #5 | D08 | — |
@@ -240,6 +240,33 @@ entry and the section it names. T12 is the scheduled moment to do that for the s
      at the boundary applies to the sync tier too.
   6. `AdapterCase.sync` is required: T07 and later rows state it, and the `sync` body
      holds an adapter marked `false` to having no tier.
+
+- **D29** (2026-11-18, T07 session) — Found while porting the pool adapter; open to veto
+  at T12 ([02](./02-adapters.md) #4).
+  1. The structural types are `PgPoolLike` (`connect`, `end`, `on`, `listenerCount`),
+     `PgPoolClientLike` (`query`, `release`) and `PgClientLike` (`query` only), not one
+     `PgClientLike` carrying `release`: a `pg.Client` has no `release`, so T15 extends
+     `PgClientLike` with `end` instead of fighting a member it lacks. `PgDriverOptions`
+     lives in `src/pg/types.ts`, where T15's `client.ts` can share it.
+  2. A `COMMIT` answered with `ROLLBACK` still rejects with the snapshot's plain `Error`
+     ("answered COMMIT with ROLLBACK"); T08 makes it `TransactionAbortedError` and updates
+     `test/pg/transaction-pinning.test.ts` with it.
+  3. `query()` with no parameters goes out as a simple query, so a text of several
+     statements runs them all and node-postgres answers an array. The adapter then
+     rejects with a `TypeError` naming `exec()`, after the statements ran. node:sqlite runs
+     only the first statement of such a text, silently. T12 decides whether the contract
+     says more (forcing the extended protocol on `pg` would refuse it before anything ran).
+  4. `close()` inside a transaction or an `exclusive` section rejects with a `TypeError`,
+     as on the single-connection core (D27.4): `pool.end()` waits for the pinned
+     connection, which is released only after the callback that awaits it.
+  5. `pnpm run test:pg` and `test:sqlite` read `test/conformance/` and the adapter's own
+     directory, not the whole tree. Under a name filter that leaves a file with no test,
+     Node 26.13.1 runs its root-level `after` before its async root `before` resolved, so
+     `test/do/probe.test.ts` started workerd and never disposed it, and the run hung. A
+     later adapter's own suites go in `test/<adapter>/`, named `<adapter>/<topic>`.
+  6. The pg-only suites take a schema per case (D20), where the snapshot shared one per
+     file; `test/_env.ts` requires `TEST_PG_DATABASE` only, and leaves an unset user or
+     password to node-postgres's own defaults.
 
 ## How to resume (for a fresh conversation)
 
