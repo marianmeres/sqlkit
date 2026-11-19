@@ -79,7 +79,7 @@ document it. The release is not a row (D22).
 
 | Status | ID  | Rank | Task | Source |
 | ------ | --- | ---- | ---- | ------ |
-| 🔒 | T21 | 1 | Owner: make the package public on npm. Precondition for T22–T24. Irreversible. | [04](./04-scaffold-docs-release.md) |
+| ✅ | T21 | 1 | Owner: make the package public on npm. Precondition for T22–T24. Irreversible. | [04](./04-scaffold-docs-release.md) |
 | ⬜ | T22 | 2 | Adopt in steve: its transaction, retry, health and quoting helpers and its insert helper go; needs its own plan | [00](./00-overview-and-roadmap.md) |
 | ⬜ | T23 | 3 | Adopt in cron: same helpers; needs its own plan | [00](./00-overview-and-roadmap.md) |
 | ⬜ | T24 | 4 | Adopt in kv: its Postgres and SQLite adapters; needs its own plan | [00](./00-overview-and-roadmap.md) |
