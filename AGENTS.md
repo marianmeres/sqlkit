@@ -8,7 +8,8 @@ an ORM, not a query builder. An app commits to one dialect.
 
 ## Quick Reference
 
-- **Toolchain**: erasable TypeScript run as written by Node (LTS, `.node-version`; `>=24.12`),
+- **Toolchain**: erasable TypeScript run as written by Node (LTS, `.node-version`;
+  `^24.20.0 || >=26.6.0`),
   pnpm, Biome, `node:test`. Published to npm only, `access: public`.
 - **Gate**: `pnpm run ci` (typecheck, lint, test) | **Test**: `pnpm test` |
   **Build**: `pnpm run build` (`dist/`, for npm only) | **Format**: `pnpm run format`

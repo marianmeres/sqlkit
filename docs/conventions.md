@@ -151,7 +151,9 @@ if (error.code === "23505" || /UNIQUE constraint failed/.test(error.message)) â€
 ## Runtime and Tooling
 
 - Node LTS is the runtime, the reference and the gate (`.node-version`; `engines.node`
-  `>=24.12`). Nothing is built, tested or documented for Deno or Bun.
+  `^24.20.0 || >=26.6.0`: before 24.20, on 25 and before 26.6, node:sqlite misreads the
+  columns of a statement SQLite recompiled after a schema change). Nothing is built,
+  tested or documented for Deno or Bun.
 - Erasable TypeScript only, run as written by Node: no `enum`, `namespace` or constructor
   parameter properties; `import type` for a type; relative imports end in `.ts`.
 - `src/core/` and `src/mod.ts` import only `src/core/`: no `node:*`, no package.

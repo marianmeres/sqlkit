@@ -794,6 +794,10 @@ takes its turn, and one from outside an open transaction waits for it. A transac
 `BEGIN IMMEDIATE`. The driver has the [sync tier](#syncdriver): `driver.sync` is the same
 handle, answering at once.
 
+The driver can keep compiled statements, to run a query or a data change again when the
+same text comes back. Over a database `openSqlite` opened it does; over a handle you
+opened, when asked: see [`SqliteDriverOptions`](#sqlitedriveroptions).
+
 ### `openSqlite(path?, options?)`
 
 Opens a database with the conventional settings and answers a driver over it: a busy
@@ -804,7 +808,8 @@ while one writes.
 - `options` (`OpenSqliteOptions`, optional)
 
 **Returns:** `Driver`. A file that cannot be opened, or a journal that cannot be switched,
-throws a `SqlError`; a path that is not a string is a `TypeError`.
+throws a `SqlError`; a path that is not a string is a `TypeError`, and so is an option out
+of its range, before anything is opened.
 
 ```ts
 import { openSqlite } from "@marianmeres/sqlkit/sqlite";
@@ -812,13 +817,15 @@ import { openSqlite } from "@marianmeres/sqlkit/sqlite";
 const db = openSqlite("app.db", { busyTimeout: 10_000 });
 ```
 
-### `createSqliteDriver(db)`
+### `createSqliteDriver(db, options?)`
 
 A driver over a database you opened. Nothing is set on the handle: its busy timeout,
 journal mode and foreign keys are as you opened it. `close()` closes it. Anything that is
-not a `DatabaseSync` is a `TypeError`.
+not a `DatabaseSync` is a `TypeError`. No compiled statement is kept unless
+`options.statementCache` asks.
 
 - `db` (`DatabaseSync`, from `node:sqlite`)
+- `options` (`SqliteDriverOptions`, optional)
 
 **Returns:** `Driver`
 
@@ -829,10 +836,52 @@ import { createSqliteDriver } from "@marianmeres/sqlkit/sqlite";
 const db = createSqliteDriver(new DatabaseSync("app.db", { timeout: 5_000 }));
 ```
 
+### `SqliteDriverOptions`
+
+```ts
+interface SqliteDriverOptions {
+	statementCache?: number; // openSqlite: 128; createSqliteDriver: 0, which keeps none
+}
+```
+
+`statementCache` is how many compiled statements the driver keeps, by their text; a whole
+number from 0. A query or a data change (a text that opens with `select`, `insert`,
+`update`, `delete`, `replace`, `with` or `values`) is compiled on its first run and kept
+to run again. A `sql` fragment renders to the same text whatever its values, so a
+statement an app repeats is compiled once, on either tier. Past the number, the least
+recently used one is dropped; a statement with a varying number of placeholders (`inList`,
+an `insert` of several rows) is one text per number. With 0 every call compiles.
+
+Any other text (a pragma, DDL) is compiled for each call, and it and every `exec` script
+empty the cache: either may change what a kept statement means. One in a hot path costs
+the statements kept around it.
+
+A kept statement answers as a new one would after a schema change, on this connection or
+another, and after a setting changed: SQLite recompiles it on its next run. What SQLite
+reads only while compiling, a kept statement read once. Done on the handle after the
+driver's first statement, these do not reach the statements already kept:
+
+- an authorizer answering differently than it did (installing one does reach them);
+- a session starting to record: a `delete` with no `where` kept before it is not in the
+  changeset;
+- a function or aggregate registered under a name already in use, with another number of
+  arguments (replacing one of the same number does reach them);
+- a virtual-table module replaced;
+- a limit lowered.
+
+None of it can be done to a database `openSqlite` opened, whose handle only the driver
+has, so it keeps 128 statements by default. `createSqliteDriver` keeps none by default:
+the handle is yours. Ask for a number there when you do none of the above.
+
+Keeping statements is why the package needs Node 24.20+ or 26.6+: an earlier node:sqlite
+misreads the columns of a statement SQLite recompiled after a schema change. `engines`
+only warns, so the driver asks the runtime, once, and keeps nothing on a Node that
+misreads, whatever the number.
+
 ### `OpenSqliteOptions`
 
 ```ts
-interface OpenSqliteOptions {
+interface OpenSqliteOptions extends SqliteDriverOptions {
 	busyTimeout?: number; // default 5000; 0 fails at once
 }
 ```

@@ -35,8 +35,10 @@ What it is not:
 npm install @marianmeres/sqlkit
 ```
 
-Node 24.12 or later. Then the client of your database, which you build and hand to the
-adapter: sqlkit imports no driver and has no peer dependency.
+Node 24.20 or later on the 24 line, or 26.6 or later; not 25. An earlier `node:sqlite`
+misreads a statement's columns after a schema change. Then the client of your database,
+which you build and hand to the adapter: sqlkit imports no driver and has no peer
+dependency.
 
 | Database                 | Client to install                                    |
 | ------------------------ | ---------------------------------------------------- |
@@ -50,13 +52,13 @@ adapter: sqlkit imports no driver and has no peer dependency.
 Each adapter is its own entry point and turns a client into a `Driver`. Everything after
 that is the same on all of them.
 
-| Entry point                  | Factory                                               | Dialect  | `db.sync` | Shape          |
-| ---------------------------- | ----------------------------------------------------- | -------- | --------- | -------------- |
-| `@marianmeres/sqlkit/sqlite` | `openSqlite(path, options)`, `createSqliteDriver(db)` | `sqlite` | yes       | one connection |
-| `@marianmeres/sqlkit/pg`     | `createPgDriver(pool, options)`                       | `pg`     | no        | a pool         |
-| `@marianmeres/sqlkit/pg`     | `createPgClientDriver(client, options)`               | `pg`     | no        | one connection |
-| `@marianmeres/sqlkit/pglite` | `createPgliteDriver(db)`                              | `pg`     | no        | one connection |
-| `@marianmeres/sqlkit/do`     | `createDoDriver(ctx.storage)`                         | `sqlite` | yes       | one connection |
+| Entry point                  | Factory                                                        | Dialect  | `db.sync` | Shape          |
+| ---------------------------- | -------------------------------------------------------------- | -------- | --------- | -------------- |
+| `@marianmeres/sqlkit/sqlite` | `openSqlite(path, options)`, `createSqliteDriver(db, options)` | `sqlite` | yes       | one connection |
+| `@marianmeres/sqlkit/pg`     | `createPgDriver(pool, options)`                                | `pg`     | no        | a pool         |
+| `@marianmeres/sqlkit/pg`     | `createPgClientDriver(client, options)`                        | `pg`     | no        | one connection |
+| `@marianmeres/sqlkit/pglite` | `createPgliteDriver(db)`                                       | `pg`     | no        | one connection |
+| `@marianmeres/sqlkit/do`     | `createDoDriver(ctx.storage)`                                  | `sqlite` | yes       | one connection |
 
 `close()` ends the client the adapter was given. A host that keeps its client does not
 call it. On Durable Objects it ends the driver and leaves the object's storage as it is.
@@ -70,8 +72,12 @@ import { openSqlite } from "@marianmeres/sqlkit/sqlite";
 const db = openSqlite("app.db");
 ```
 
+A query or a data change is compiled once and kept for the next call with the same text
+(`statementCache`, 128 statements by default).
+
 `createSqliteDriver(new DatabaseSync(path))` takes a database you opened and sets nothing
-on it.
+on it. It keeps no statement unless you ask: see
+[`SqliteDriverOptions`](./API.md#sqlitedriveroptions).
 
 ### Postgres, a pool (node-postgres)
 

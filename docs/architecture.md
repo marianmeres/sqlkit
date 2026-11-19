@@ -105,13 +105,13 @@ outside runs on another connection at once.
 
 ## Adapters
 
-| Entry      | Factory                                               | `adapter`           | Dialect  | Shape             | `sync` | `concurrentWriters` | `crossProcessLock` |
-| ---------- | ----------------------------------------------------- | ------------------- | -------- | ----------------- | ------ | ------------------- | ------------------ |
-| `./sqlite` | `createSqliteDriver(db)`, `openSqlite(path, options)` | `"node:sqlite"`     | `sqlite` | single connection | true   | false               | false              |
-| `./pg`     | `createPgDriver(pool, options)`                       | `"pg"`              | `pg`     | pool              | false  | true                | true               |
-| `./pg`     | `createPgClientDriver(client, options)`               | `"pg-client"`       | `pg`     | single connection | false  | false               | true               |
-| `./pglite` | `createPgliteDriver(db)`                              | `"pglite"`          | `pg`     | single connection | false  | false               | false              |
-| `./do`     | `createDoDriver(storage)`                             | `"durable-objects"` | `sqlite` | single connection | true   | false               | false              |
+| Entry      | Factory                                                        | `adapter`           | Dialect  | Shape             | `sync` | `concurrentWriters` | `crossProcessLock` |
+| ---------- | -------------------------------------------------------------- | ------------------- | -------- | ----------------- | ------ | ------------------- | ------------------ |
+| `./sqlite` | `createSqliteDriver(db, options)`, `openSqlite(path, options)` | `"node:sqlite"`     | `sqlite` | single connection | true   | false               | false              |
+| `./pg`     | `createPgDriver(pool, options)`                                | `"pg"`              | `pg`     | pool              | false  | true                | true               |
+| `./pg`     | `createPgClientDriver(client, options)`                        | `"pg-client"`       | `pg`     | single connection | false  | false               | true               |
+| `./pglite` | `createPgliteDriver(db)`                                       | `"pglite"`          | `pg`     | single connection | false  | false               | false              |
+| `./do`     | `createDoDriver(storage)`                                      | `"durable-objects"` | `sqlite` | single connection | true   | false               | false              |
 
 - **The host builds the client.** No adapter imports its driver library, not even its
   types: each declares the shape it takes structurally (`PgPoolLike`,
@@ -123,6 +123,23 @@ outside runs on another connection at once.
 - **node:sqlite**: a transaction is `BEGIN IMMEDIATE`; a read-only one a deferred `BEGIN`
   with `query_only` on. `createSqliteDriver` sets nothing on the handle; `openSqlite` sets
   a busy timeout (5000 ms) and WAL for a file.
+- **node:sqlite keeps statements** (`statementCache`: 128 in `openSqlite`, 0 in
+  `createSqliteDriver`). A query or a data change, told by its first word, is compiled
+  once and kept by its text, the least recently used dropped; both tiers share them.
+  - SQLite recompiles a kept statement itself when the schema or a setting changed under
+    it. Where it does not, the driver empties the cache: after any text that is not kept
+    (a pragma, DDL) and after any `exec` script. A table made in `main` stands in front
+    of an attached one of its name, and a pragma can change what a statement returns.
+    A transaction's own statements go to the handle and empty nothing.
+  - What only the host can change, on its handle, is not seen: an authorizer's changed
+    answer, a session opened, a function overload or module registered, a limit lowered.
+    Hence the 0 for a handle the host keeps.
+  - A kept statement that is running (a function the host registered sent its text
+    again) is not run twice: the inner call compiles its own. One found finalized (the
+    host closed the handle) empties the cache, and the text is compiled again.
+  - Nothing is kept where node:sqlite misreads a recompiled statement's columns: Node
+    before 24.20 and 26.6, which `engines` rules out. `engines` only warns, so
+    `rereadsColumns` asks the runtime once.
 - **Postgres**: a read-only transaction is `REPEATABLE READ READ ONLY`. `COMMIT` is
   checked, not trusted (Postgres answers an aborted transaction's `COMMIT` with
   `ROLLBACK`). `exclusive` is an advisory lock keyed by the name and `current_schema()`,
