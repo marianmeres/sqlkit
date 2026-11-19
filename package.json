@@ -10,7 +10,7 @@
     "node": ">=24.12"
   },
   "publishConfig": {
-    "access": "restricted"
+    "access": "public"
   },
   "sideEffects": false,
   "main": "./dist/mod.js",
