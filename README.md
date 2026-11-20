@@ -110,6 +110,25 @@ const db = createPgClientDriver(client);
 The same driver over one session: a statement from outside an open transaction waits for
 it to end.
 
+### Postgres, in a library
+
+A library does not know what its host holds, so its `db` option takes any of the three: a
+pool, a client, or a `Driver` the host built.
+
+```ts
+import { type PgDb, toPgDriver } from "@marianmeres/sqlkit/pg";
+
+export function createQueue(options: { db: PgDb }) {
+	const db = toPgDriver(options.db);
+	// …
+}
+```
+
+A `Driver` comes back as it is. A pool or a client gets one driver, however many libraries
+and calls convert it, so they share its `error` listener and, on one client, its turn. See
+[`toPgDriver`](./API.md#topgdriverdb) for how a pool is told from a client, and
+[`isDriver`](./API.md#isdrivervalue) for the check on its own.
+
 ### PGlite
 
 ```ts

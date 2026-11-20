@@ -23,6 +23,7 @@ export {
 	type Capabilities,
 	type DialectName,
 	type Driver,
+	isDriver,
 	type QueryResult,
 	type Row,
 	readOnlyOf,

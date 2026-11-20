@@ -1,6 +1,7 @@
 // The `driver` conformance body: the contract's rules R1–R12 (plan doc 01 #2; R12, the
-// savepoint, is backlog T26), at least one case per rule, and `checkHealth` on a live and
-// on a closed driver (plan doc 03 #3), on every registered adapter (plan doc 02 #2). Ported from the prior
+// savepoint, is backlog T26), at least one case per rule, `checkHealth` on a live and
+// on a closed driver (plan doc 03 #3), and `isDriver`, which every adapter's driver has to
+// satisfy, on every registered adapter (plan doc 02 #2). Ported from the prior
 // implementation's driver conformance file
 // (tmp/prior-art/engine/test/conformance/00-driver.test.ts), without its changeLock, json
 // and likePrefix groups.
@@ -15,6 +16,7 @@ import assert from "node:assert/strict";
 import {
 	checkHealth,
 	type Driver,
+	isDriver,
 	SqlError,
 	sql,
 	TransactionAbortedError,
@@ -1111,5 +1113,20 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 		assert.equal(status.latencyMs, null);
 		assert.ok(status.error instanceof SqlError, String(status.error));
 		assert.equal(status.error.dialect, db.dialect);
+	});
+
+	// `isDriver` reads the contract member by member, so a member added to it and left out
+	// of an adapter shows here. What a callback is handed is the driver; the sync tier has
+	// no `exclusive` and no `close`, and is not one.
+	test("isDriver: the driver is one, in a transaction too, and its sync tier is not", async (db) => {
+		assert.equal(isDriver(db), true);
+		await db.transaction(async (tx) => {
+			assert.equal(isDriver(tx), true);
+			await tx.savepoint(async (inner) => {
+				assert.equal(isDriver(inner), true);
+			});
+		});
+		assert.equal(adapter.sync, db.sync !== undefined);
+		if (db.sync !== undefined) assert.equal(isDriver(db.sync), false);
 	});
 }

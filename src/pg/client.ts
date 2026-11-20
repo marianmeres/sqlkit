@@ -52,6 +52,7 @@ import type { Connection, SingleConnectionBackend } from "../single/backend.ts";
 import { createSingleConnectionDriver } from "../single/driver.ts";
 import { type LockStatement, lockKeyOf, takeLock, unlock } from "./lock.ts";
 import { BEGIN_READ_ONLY, notCommitted, resultOf, searchPathOf } from "./session.ts";
+import { countsConnections, isClientShaped } from "./shape.ts";
 import type {
 	PgDriverOptions,
 	PgQueryConfigLike,
@@ -197,19 +198,13 @@ function clientBackend(
 
 /** A client, refused before anything starts when it is not shaped like one, or is a pool. */
 function assertClient(client: unknown): asserts client is PgStandaloneClientLike {
-	const shaped =
-		typeof client === "object" &&
-		client !== null &&
-		["query", "end", "on", "listenerCount"].every(
-			(method) => typeof (client as Record<string, unknown>)[method] === "function",
-		);
-	if (!shaped) {
+	if (!isClientShaped(client)) {
 		throw new TypeError(
 			"createPgClientDriver(client) takes a node-postgres pg.Client",
 		);
 	}
 	// node-postgres's pool counts its connections; a client has none to count.
-	if (typeof (client as { totalCount?: unknown }).totalCount === "number") {
+	if (countsConnections(client)) {
 		throw new TypeError(
 			"createPgClientDriver(client) takes one pg.Client, and this is a pool: each of " +
 				"its statements may take another connection. createPgDriver takes a pool",

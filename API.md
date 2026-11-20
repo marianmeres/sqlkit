@@ -2,15 +2,15 @@
 
 Every export of every entry point. Each entry point is its own subpath export:
 
-| Entry point                                                           | Holds                                                                                 |
-| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| [`@marianmeres/sqlkit`](#marianmeressqlkit)                           | fragments, the driver contract, parameters, errors, builders, decoders, retry, health |
-| [`@marianmeres/sqlkit/sqlite`](#marianmeressqlkitsqlite)              | the node:sqlite adapter, with the sync tier                                           |
-| [`@marianmeres/sqlkit/pg`](#marianmeressqlkitpg)                      | the node-postgres adapter: over a pool, or over one client                            |
-| [`@marianmeres/sqlkit/pglite`](#marianmeressqlkitpglite)              | the PGlite adapter                                                                    |
-| [`@marianmeres/sqlkit/do`](#marianmeressqlkitdo)                      | the Durable Objects adapter, with the sync tier                                       |
-| [`@marianmeres/sqlkit/migrate`](#marianmeressqlkitmigrate)            | `@marianmeres/migrate` wired over a `Driver`                                          |
-| [`@marianmeres/sqlkit/migrate/files`](#marianmeressqlkitmigratefiles) | SQL files as migration versions (Node only)                                           |
+| Entry point                                                           | Holds                                                                                      |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| [`@marianmeres/sqlkit`](#marianmeressqlkit)                           | fragments, the driver contract, parameters, errors, builders, decoders, retry, health      |
+| [`@marianmeres/sqlkit/sqlite`](#marianmeressqlkitsqlite)              | the node:sqlite adapter, with the sync tier                                                |
+| [`@marianmeres/sqlkit/pg`](#marianmeressqlkitpg)                      | the node-postgres adapter: over a pool, over one client, or whichever a library was handed |
+| [`@marianmeres/sqlkit/pglite`](#marianmeressqlkitpglite)              | the PGlite adapter                                                                         |
+| [`@marianmeres/sqlkit/do`](#marianmeressqlkitdo)                      | the Durable Objects adapter, with the sync tier                                            |
+| [`@marianmeres/sqlkit/migrate`](#marianmeressqlkitmigrate)            | `@marianmeres/migrate` wired over a `Driver`                                               |
+| [`@marianmeres/sqlkit/migrate/files`](#marianmeressqlkitmigratefiles) | SQL files as migration versions (Node only)                                                |
 
 Two rules hold across all of them:
 
@@ -355,6 +355,32 @@ type Row = Record<string, unknown>;
 ```
 
 A row as a driver hands it back: a plain object, one property per selected column.
+
+#### `isDriver(value)`
+
+Whether `value` is a `Driver`: what a library asks when its `db` option takes a driver or
+something else (a pool, a database handle), before it decides which it was handed.
+
+By its shape, not by a mark: `Driver` is an interface, so one built by another copy of
+this package, or by an adapter written outside it, is a driver all the same. The shape is
+the contract as this version states it, every member of it: `dialect` (`"pg"` or
+`"sqlite"`), `adapter`, the three `capabilities`, the six methods, and a `sync` tier's four
+when there is one. So a driver built before `savepoint` was added is not one, as the type
+would not take it either, and neither is a `SyncDriver`.
+
+**Returns:** `boolean`; it narrows `value` to `Driver`.
+
+```ts
+import { isDriver } from "@marianmeres/sqlkit";
+import { createSqliteDriver } from "@marianmeres/sqlkit/sqlite";
+
+// `options.db` is a `DatabaseSync` or a `Driver`. Decided once, where the library is set
+// up: a handle gets one driver, not one per call.
+const db = isDriver(options.db) ? options.db : createSqliteDriver(options.db);
+```
+
+For node-postgres, [`toPgDriver`](#topgdriverdb) decides between a pool, a client and a
+driver in one call.
 
 ### Parameters
 
@@ -949,8 +975,9 @@ thread: the handle is synchronous.
 ## `@marianmeres/sqlkit/pg`
 
 The node-postgres adapter. Two factories, so that nothing is guessed from an object's
-shape. Nothing is imported from `pg`: a `pg.Pool` or a `pg.Client` fits the structural
-types below as it is.
+shape, and [`toPgDriver`](#topgdriverdb) for a library that is handed a pool, a client or
+a driver and has to tell. Nothing is imported from `pg`: a `pg.Pool` or a `pg.Client` fits
+the structural types below as it is.
 
 On both, `query()` goes out on the extended protocol, so a text of several statements is
 refused by the server before any of it runs; `exec()` is a simple query, any number of
@@ -1007,6 +1034,68 @@ const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 await client.connect();
 const db = createPgClientDriver(client, { schema: "app" });
 ```
+
+### `toPgDriver(db)`
+
+The `Driver` for whatever a library was handed as its database: the one function here
+that reads an object's shape to decide what it is. An app knows what it holds and calls a
+factory; a library whose `db` option takes any of the three calls this.
+
+- `db` ([`PgDb`](#pgdb)): a `pg.Pool`, a connected `pg.Client`, or a `Driver` of the `pg`
+  dialect.
+
+**Returns:** `Driver`.
+
+- **A `Driver`** comes back as it is: not wrapped, not kept. A PGlite driver is one of the
+  `pg` dialect, and passes.
+- **A pool or a client** gets the driver its factory builds, with no options: built on the
+  first call, and the same one on every later call with that object. For a driver bound
+  to a schema, build it with the factory and pass the `Driver`.
+
+A pool is told by its count of connections (a numeric `totalCount`, as node-postgres's
+has), or by having no `query()` of its own, which a client cannot lack. Anything else that
+has a client's methods is taken for a client. A pool of another make, which has `query()`
+and counts nothing, would be: pass it to `createPgDriver` yourself.
+
+Anything else is a `TypeError`: a value that is none of the three, a `Driver` of another
+dialect, and a `Driver` that lacks a member of the contract (one built by an older version
+of this package), which the message names.
+
+```ts
+import { type PgDb, toPgDriver } from "@marianmeres/sqlkit/pg";
+
+export function createQueue(options: { db: PgDb }) {
+	const db = toPgDriver(options.db);
+	// …everything else talks to `db`
+}
+```
+
+**One driver per pool, and per client**, because a second one over the same object is not
+harmless:
+
+- Each driver listens to the pool's or client's `error` event and reports one only when
+  nobody else listens. Two drivers take each other for the host's listener, and the error
+  is reported by neither.
+- One client is one session. Two drivers over it each give their own transactions their
+  turn and know nothing of the other's: a statement sent through one lands inside the
+  transaction the other has open, and goes with its rollback.
+
+So every caller that converts the same pool or client shares one driver, and with it its
+transactions: a statement issued inside a transaction's callback joins that transaction,
+whoever converted. The driver is kept per copy of this package. An app whose libraries
+resolve to two copies has one driver per copy: hand them one `Driver` instead of the pool
+or the client.
+
+Nothing is connected, sent or closed. `close()` on the driver ends the pool or the client,
+as on any driver: a library that was handed its database does not call it.
+
+### `PgDb`
+
+```ts
+type PgDb = PgPoolLike | PgStandaloneClientLike | Driver;
+```
+
+What `toPgDriver` takes, and the type for a library's own `db` option.
 
 ### `PgDriverOptions`
 

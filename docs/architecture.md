@@ -56,25 +56,27 @@ query(statement | text, params?)
 
 ## Key Files
 
-| File                     | Owns                                                                         |
-| ------------------------ | ---------------------------------------------------------------------------- |
-| `src/core/sql.ts`        | `Sql` fragments, `render`, `ident`, `json`, quoting                          |
-| `src/core/params.ts`     | the parameter rule (`normalizeParam`, `normalizeParams`)                     |
-| `src/core/contract.ts`   | `Driver`, `SyncDriver`, R1–R12 and S1–S6 in doc comments, `statementOf`      |
-| `src/core/errors.ts`     | `SqlError`, its subclasses, `toSqlError`                                     |
-| `src/core/savepoint.ts`  | a savepoint by statement, for the adapters whose database takes `SAVEPOINT`  |
-| `src/core/classify-*.ts` | one classifier per dialect: driver error → `SqlErrorInfo`                    |
-| `src/core/build.ts`      | `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` |
-| `src/core/decode.ts`     | `decode.*`, `decodeRow`, `decodeRows`                                        |
-| `src/core/retry.ts`      | `withRetry`                                                                  |
-| `src/core/health.ts`     | `checkHealth`, `createHealthMonitor`                                         |
-| `src/single/backend.ts`  | the backend seam: `SingleConnectionBackend`, `SyncBackend`                   |
-| `src/single/driver.ts`   | `createSingleConnectionDriver`: the one-connection rule, both tiers          |
-| `src/pg/pool.ts`         | `createPgDriver` over a pool                                                 |
-| `src/pg/lock.ts`         | the polled advisory lock both Postgres drivers take                          |
-| `src/pg/session.ts`      | what the two Postgres drivers share: read-only `BEGIN`, `COMMIT` check       |
-| `src/pg/types.ts`        | the structural node-postgres shapes                                          |
-| `src/do/mod.ts`          | `createDoDriver`: a Durable Object's storage as a backend, both tiers        |
+| File                     | Owns                                                                                |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| `src/core/sql.ts`        | `Sql` fragments, `render`, `ident`, `json`, quoting                                 |
+| `src/core/params.ts`     | the parameter rule (`normalizeParam`, `normalizeParams`)                            |
+| `src/core/contract.ts`   | `Driver`, `SyncDriver`, R1–R12 and S1–S6 in doc comments, `statementOf`, `isDriver` |
+| `src/core/errors.ts`     | `SqlError`, its subclasses, `toSqlError`                                            |
+| `src/core/savepoint.ts`  | a savepoint by statement, for the adapters whose database takes `SAVEPOINT`         |
+| `src/core/classify-*.ts` | one classifier per dialect: driver error → `SqlErrorInfo`                           |
+| `src/core/build.ts`      | `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList`        |
+| `src/core/decode.ts`     | `decode.*`, `decodeRow`, `decodeRows`                                               |
+| `src/core/retry.ts`      | `withRetry`                                                                         |
+| `src/core/health.ts`     | `checkHealth`, `createHealthMonitor`                                                |
+| `src/single/backend.ts`  | the backend seam: `SingleConnectionBackend`, `SyncBackend`                          |
+| `src/single/driver.ts`   | `createSingleConnectionDriver`: the one-connection rule, both tiers                 |
+| `src/pg/pool.ts`         | `createPgDriver` over a pool                                                        |
+| `src/pg/lock.ts`         | the polled advisory lock both Postgres drivers take                                 |
+| `src/pg/session.ts`      | what the two Postgres drivers share: read-only `BEGIN`, `COMMIT` check              |
+| `src/pg/types.ts`        | the structural node-postgres shapes                                                 |
+| `src/pg/shape.ts`        | those shapes read at run time: a pool, a client, what tells them apart              |
+| `src/pg/to-driver.ts`    | `toPgDriver`: a pool, a client or a `Driver` in, one `Driver` per object out        |
+| `src/do/mod.ts`          | `createDoDriver`: a Durable Object's storage as a backend, both tiers               |
 
 ## The Single-Connection Rule
 
@@ -170,6 +172,15 @@ the savepoint and rejects with `TransactionAbortedError`.
   polled with `pg_try_advisory_lock`. `options.schema` binds the driver to one schema.
   `query()` uses the extended protocol, so a text of several statements is refused by the
   server; `exec()` is a simple query.
+- **Postgres, for a library**: the two factories read no shape, since an app knows what
+  it holds. A library that takes a pool, a client or a `Driver` does not, so
+  `toPgDriver(db)` decides, by one rule: a `Driver` (told by `isDriver`, every member of
+  the contract) is handed back; a pool is what counts its connections or has no `query()`;
+  anything else with a client's methods is a client. It keeps the driver it built, one per
+  pool and per client, in a `WeakMap`. Two drivers over one object are not harmless: their
+  `error` listeners take each other for the host's and neither reports, and on one client
+  each sends into the transaction the other has open. The map is the module's, so two
+  copies of the package build a driver each.
 - **PGlite**: Postgres compiled to WebAssembly, in process: the in-memory database for
   tests of code that runs on Postgres. No cross-process lock.
 

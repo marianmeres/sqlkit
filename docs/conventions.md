@@ -23,6 +23,8 @@
 ## Naming
 
 - Factories: `create<Name>Driver`; `openSqlite` is the one convenience that opens a client.
+  `toPgDriver` is not one: it may hand back the driver it was given, or one it built
+  before.
 - Structural client shapes: `<Name>Like` (`PgPoolLike`, `PgliteLike`).
 - `Driver.adapter`: `"node:sqlite"`, `"pg"`, `"pg-client"`, `"pglite"`, `"durable-objects"`.
 - Suites: a conformance body's cases run under `describe(<adapter name>)` and start with

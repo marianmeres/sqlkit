@@ -92,6 +92,7 @@ import {
 	resultOf,
 	searchPathOf,
 } from "./session.ts";
+import { isPoolShaped } from "./shape.ts";
 import type {
 	PgClientLike,
 	PgDriverOptions,
@@ -609,13 +610,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 
 /** A pool, refused before anything starts when it is not shaped like one. */
 function assertPool(pool: unknown): asserts pool is PgPoolLike {
-	const shaped =
-		typeof pool === "object" &&
-		pool !== null &&
-		["connect", "end", "on", "listenerCount"].every(
-			(method) => typeof (pool as Record<string, unknown>)[method] === "function",
-		);
-	if (!shaped) {
+	if (!isPoolShaped(pool)) {
 		throw new TypeError("createPgDriver(pool) takes a node-postgres pg.Pool");
 	}
 }

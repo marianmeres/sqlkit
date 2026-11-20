@@ -29,7 +29,7 @@ migrations. Not an ORM, not a query builder. An app commits to one dialect.
 | `src/core/`                                |                   | fragments, contract, params, errors, classifiers, savepoint statements, builders, decoders, retry, health |
 | `src/single/`                              |                   | the single-connection driver core and its backend seam                                                    |
 | `src/sqlite/mod.ts`                        | `./sqlite`        | node:sqlite (with the sync tier)                                                                          |
-| `src/pg/mod.ts`                            | `./pg`            | node-postgres: a pool, or one client                                                                      |
+| `src/pg/mod.ts`                            | `./pg`            | node-postgres: a pool, or one client; `toPgDriver` for a library handed either, or a `Driver`             |
 | `src/pglite/mod.ts`                        | `./pglite`        | PGlite                                                                                                    |
 | `src/do/mod.ts`                            | `./do`            | Durable Objects SQLite storage (with the sync tier; needs `nodejs_compat`)                                |
 | `src/migrate/mod.ts`                       | `./migrate`       | `@marianmeres/migrate` wired over a `Driver`                                                              |

@@ -1,6 +1,7 @@
 /**
- * The driver contract: the two interfaces every adapter implements, and the small helpers
- * every adapter calls before a statement reaches its database.
+ * The driver contract: the two interfaces every adapter implements, the small helpers
+ * every adapter calls before a statement reaches its database, and `isDriver`, which tells
+ * a driver from whatever else a caller was handed.
  *
  * `Driver` is asynchronous and every adapter has one. `SyncDriver` is its synchronous
  * sibling, exposed as `driver.sync` by an adapter whose engine is synchronous underneath:
@@ -223,6 +224,82 @@ export interface SyncDriver {
 	 * its own when none is open.
 	 */
 	savepoint<T>(fn: (tx: SyncDriver) => T): T;
+}
+
+/** A {@link Driver}'s methods. */
+const DRIVER_METHODS = [
+	"query",
+	"exec",
+	"transaction",
+	"exclusive",
+	"savepoint",
+	"close",
+] as const;
+
+/** A {@link SyncDriver}'s methods. */
+const SYNC_METHODS = ["query", "exec", "transaction", "savepoint"] as const;
+
+/** The facts a {@link Capabilities} states. */
+const CAPABILITIES = ["sync", "concurrentWriters", "crossProcessLock"] as const;
+
+/**
+ * What `value` lacks to be a {@link Driver}, each as a refusal names it (`"savepoint()"`,
+ * `"capabilities.sync"`); nothing for a driver. `undefined` for a value that is not an
+ * object at all.
+ *
+ * It is the contract as this version states it, member by member, and no more than their
+ * types: a driver built before a member was added lacks that member, here as in the
+ * type.
+ */
+export function missingFromDriver(value: unknown): string[] | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const driver = value as Record<string, unknown>;
+	const missing: string[] = [];
+	if (driver.dialect !== "pg" && driver.dialect !== "sqlite") {
+		missing.push('dialect of "pg" or "sqlite"');
+	}
+	if (typeof driver.adapter !== "string") missing.push("adapter name");
+	const capabilities = driver.capabilities;
+	if (typeof capabilities !== "object" || capabilities === null) {
+		missing.push("capabilities");
+	} else {
+		for (const fact of CAPABILITIES) {
+			if (typeof (capabilities as Record<string, unknown>)[fact] !== "boolean") {
+				missing.push(`capabilities.${fact}`);
+			}
+		}
+	}
+	for (const method of DRIVER_METHODS) {
+		if (typeof driver[method] !== "function") missing.push(`${method}()`);
+	}
+	// The sync tier is optional; one that is there has to be one.
+	const sync = driver.sync;
+	if (sync !== undefined) {
+		for (const method of SYNC_METHODS) {
+			if (
+				typeof sync !== "object" ||
+				sync === null ||
+				typeof (sync as Record<string, unknown>)[method] !== "function"
+			) {
+				missing.push(`sync.${method}()`);
+			}
+		}
+	}
+	return missing;
+}
+
+/**
+ * Whether `value` is a {@link Driver}: what a library asks when its `db` option takes a
+ * driver or something else (a pool, a database handle), before it decides which it got.
+ *
+ * By its shape, not by a mark: `Driver` is an interface, so one built by another copy of
+ * this package, or by an adapter written outside it, is a driver all the same. The shape
+ * is the contract as this version states it, every member of it: a driver built before
+ * `savepoint` was added is not one, as the type would not take it either. A `SyncDriver`
+ * is not one: it has no `exclusive` and no `close`.
+ */
+export function isDriver(value: unknown): value is Driver {
+	return missingFromDriver(value)?.length === 0;
 }
 
 /**
