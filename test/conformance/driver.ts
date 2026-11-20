@@ -1,6 +1,6 @@
-// The `driver` conformance body: the contract's rules R1–R11 (plan doc 01 #2), at least one
-// case per rule, and `checkHealth` on a live and on a closed driver (plan doc 03 #3), on
-// every registered adapter (plan doc 02 #2). Ported from the prior
+// The `driver` conformance body: the contract's rules R1–R12 (plan doc 01 #2; R12, the
+// savepoint, is backlog T26), at least one case per rule, and `checkHealth` on a live and
+// on a closed driver (plan doc 03 #3), on every registered adapter (plan doc 02 #2). Ported from the prior
 // implementation's driver conformance file
 // (tmp/prior-art/engine/test/conformance/00-driver.test.ts), without its changeLock, json
 // and likePrefix groups.
@@ -141,6 +141,16 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 			promiseOf("exclusive", () => db.exclusive("lock", "fn" as never)),
 			typeError(),
 		);
+		await assert.rejects(
+			promiseOf("savepoint", () => db.savepoint(undefined as never)),
+			typeError(),
+		);
+		await db.transaction(async (tx) => {
+			await assert.rejects(
+				promiseOf("tx.savepoint", () => tx.savepoint("fn" as never)),
+				typeError(),
+			);
+		});
 		// Nothing was left open or queued by a refusal: the connection still answers.
 		assert.equal(await count(db), 0);
 	});
@@ -722,6 +732,365 @@ export function driverContract(suite: Suite, adapter: AdapterCase): void {
 			"insert into t (id, name) values ('returned', 'r') returning id",
 		);
 		assert.equal(Object.getPrototypeOf(returned.rows[0]), Object.prototype);
+	});
+
+	// ── R12: savepoints ─────────────────────────────────────────────────────────────
+
+	test("R12: a savepoint that resolves is kept with its transaction, and answers its value", async (db) => {
+		const answer = await db.transaction(async (tx) => {
+			await insert(tx, "before");
+			const inner = await tx.savepoint(async (sp) => {
+				assert.equal(
+					sp,
+					db,
+					"the savepoint's callback was handed another handle",
+				);
+				assert.equal(
+					await count(sp, "before"),
+					1,
+					"it is not in its transaction",
+				);
+				await insert(sp, "inside");
+				return "inner value";
+			});
+			assert.equal(await count(tx, "inside"), 1);
+			return inner;
+		});
+		assert.equal(answer, "inner value");
+		assert.equal(await count(db), 2);
+
+		// Kept is not committed: it goes with a transaction that rolls back after it.
+		const failed = new Error("outer failed");
+		await assert.rejects(
+			db.transaction(async (tx) => {
+				await tx.savepoint((sp) => insert(sp, "released"));
+				throw failed;
+			}),
+			(error) => error === failed,
+		);
+		assert.equal(await count(db, "released"), 0);
+	});
+
+	test("R12: a savepoint that rejects is undone alone, with that rejection, and the transaction goes on", async (db) => {
+		const boom = new Error("boom");
+		await db.transaction(async (tx) => {
+			await insert(tx, "before");
+			await assert.rejects(
+				tx.savepoint(async (sp) => {
+					await insert(sp, "undone-query");
+					await sp.exec("insert into t (id, name) values ('undone-exec', 'x')");
+					assert.equal(await count(sp), 3);
+					throw boom;
+				}),
+				(error) => error === boom,
+			);
+			assert.equal(await count(tx), 1, "the savepoint's writes outlived it");
+			await insert(tx, "after");
+		});
+		assert.equal(await count(db, "before"), 1);
+		assert.equal(await count(db, "after"), 1);
+		assert.equal(await count(db), 2);
+	});
+
+	test("R12: a statement that fails inside a savepoint does not take the transaction with it", async (db) => {
+		// On Postgres a failed statement aborts the whole transaction, and rolling back to
+		// the savepoint is what lifts that: the statements after it run, and it commits.
+		await db.transaction(async (tx) => {
+			await insert(tx, "kept");
+			await assert.rejects(
+				tx.savepoint(async (sp) => {
+					await insert(sp, "undone");
+					await insert(sp, "kept");
+				}),
+				(error) =>
+					error instanceof SqlError &&
+					error.kind === "unique" &&
+					!(error instanceof TransactionAbortedError),
+			);
+			await insert(tx, "after");
+			assert.equal(await count(tx), 2);
+		});
+		assert.equal(await count(db), 2);
+		assert.equal(await count(db, "undone"), 0);
+	});
+
+	test("R12: a failed statement the savepoint's callback swallowed: SQLite keeps the rest, Postgres undoes the savepoint", async (db) => {
+		await db.transaction(async (tx) => {
+			await insert(tx, "before");
+			const outcome = tx.savepoint(async (sp) => {
+				await insert(sp, "inside");
+				await assert.rejects(insert(sp, "inside"), "a duplicate was accepted");
+				return "swallowed";
+			});
+			if (db.dialect === "sqlite") {
+				// SQLite has no aborted state: the failed statement is undone, the rest stays.
+				assert.equal(await outcome, "swallowed");
+				assert.equal(await count(tx, "inside"), 1);
+			} else {
+				// Postgres aborted the transaction, so the savepoint cannot be released:
+				// it is rolled back to, which recovers the transaction, and says so.
+				await assert.rejects(
+					outcome,
+					(error) =>
+						error instanceof TransactionAbortedError &&
+						error.kind === "aborted" &&
+						error.dialect === "pg",
+				);
+				assert.equal(await count(tx, "inside"), 0);
+			}
+			await insert(tx, "after");
+		});
+		assert.equal(await count(db, "before"), 1);
+		assert.equal(await count(db, "after"), 1);
+		assert.equal(await count(db, "inside"), db.dialect === "sqlite" ? 1 : 0);
+	});
+
+	test("R12: savepoints nest: an inner one is undone alone, and goes with an outer one that is undone", async (db) => {
+		const inner = new Error("inner failed");
+		const outer = new Error("outer failed");
+		await db.transaction(async (tx) => {
+			await tx.savepoint(async (a) => {
+				await insert(a, "a");
+				await assert.rejects(
+					a.savepoint(async (b) => {
+						await insert(b, "b-undone");
+						throw inner;
+					}),
+					(error) => error === inner,
+				);
+				assert.equal(await count(a, "b-undone"), 0);
+				await a.savepoint((b) => insert(b, "b-kept"));
+			});
+			assert.equal(await count(tx), 2);
+
+			await assert.rejects(
+				tx.savepoint(async (c) => {
+					await insert(c, "c");
+					// Released into the one around it, and undone with that one.
+					await c.savepoint((d) => insert(d, "d"));
+					// A nested transaction joins the savepoint it is in (R4).
+					await c.transaction((joined) => insert(joined, "joined"));
+					assert.equal(await count(c), 5);
+					throw outer;
+				}),
+				(error) => error === outer,
+			);
+			assert.equal(await count(tx), 2);
+		});
+		assert.equal(await count(db), 2);
+		assert.equal(await count(db, "a"), 1);
+		assert.equal(await count(db, "b-kept"), 1);
+	});
+
+	test("R12: outside a transaction a savepoint is a transaction of its own", async (db) => {
+		const answer = await db.savepoint(async (tx) => {
+			await insert(tx, "kept");
+			return "value";
+		});
+		assert.equal(answer, "value");
+		assert.equal(await count(db, "kept"), 1);
+
+		const boom = new Error("boom");
+		await assert.rejects(
+			db.savepoint(async (tx) => {
+				await insert(tx, "undone");
+				throw boom;
+			}),
+			(error) => error === boom,
+		);
+		assert.equal(await count(db, "undone"), 0);
+
+		// It is a transaction in every respect: a savepoint inside it is a savepoint.
+		await db.savepoint(async (tx) => {
+			await insert(tx, "outer");
+			await assert.rejects(
+				tx.savepoint(async (sp) => {
+					await insert(sp, "inner");
+					throw boom;
+				}),
+				(error) => error === boom,
+			);
+		});
+		assert.equal(await count(db, "outer"), 1);
+		assert.equal(await count(db, "inner"), 0);
+	});
+
+	test("R12: what the transaction issues while a savepoint is open waits for it, and does not go with it", async (db) => {
+		const boom = new Error("boom");
+		const entered = gate();
+		const proceed = gate();
+		const order: string[] = [];
+		await db.transaction(async (tx) => {
+			const savepoint = tx.savepoint(async (sp) => {
+				await insert(sp, "inside");
+				entered.open();
+				await proceed.opened;
+				// Across a real timer: what waits has every chance to run meanwhile.
+				await sleep(20);
+				order.push("the savepoint ends");
+				throw boom;
+			});
+			await entered.opened;
+			// Issued by the transaction, from outside the savepoint's callback.
+			const query = insert(tx, "outside-query").then(() => order.push("query"));
+			const script = tx
+				.exec("insert into t (id, name) values ('outside-exec', 'x')")
+				.then(() => order.push("exec"));
+			const nested = tx
+				.transaction((joined) => insert(joined, "outside-joined"))
+				.then(() => order.push("joined"));
+			proceed.open();
+			await assert.rejects(savepoint, (error) => error === boom);
+			await Promise.all([query, script, nested]);
+			assert.deepEqual(order, ["the savepoint ends", "query", "exec", "joined"]);
+			assert.equal(await count(tx), 3);
+		});
+		assert.equal(await count(db, "inside"), 0);
+		for (const id of ["outside-query", "outside-exec", "outside-joined"]) {
+			assert.equal(await count(db, id), 1, `${id} went with the savepoint`);
+		}
+	});
+
+	test("R12: savepoints opened at once in one transaction run one after the other", async (db) => {
+		const boom = new Error("boom");
+		const trace: string[] = [];
+		await db.transaction(async (tx) => {
+			const unit = (id: string, fails: boolean): Promise<void> =>
+				tx.savepoint(async (sp) => {
+					trace.push(`${id} begins`);
+					await insert(sp, id);
+					await sleep(10);
+					trace.push(`${id} ends`);
+					if (fails) throw boom;
+				});
+			const [first, second, third] = await Promise.allSettled([
+				unit("first", false),
+				unit("second", true),
+				unit("third", false),
+			]);
+			assert.equal(first.status, "fulfilled");
+			assert.ok(second.status === "rejected" && second.reason === boom);
+			assert.equal(third.status, "fulfilled");
+		});
+		assert.deepEqual(trace, [
+			"first begins",
+			"first ends",
+			"second begins",
+			"second ends",
+			"third begins",
+			"third ends",
+		]);
+		assert.equal(await count(db, "first"), 1);
+		assert.equal(await count(db, "second"), 0);
+		assert.equal(await count(db, "third"), 1);
+	});
+
+	test("R12: a savepoint the transaction did not await ends before the transaction does", async (db) => {
+		let unawaited: Promise<unknown> | undefined;
+		await db.transaction(async (tx) => {
+			await insert(tx, "before");
+			unawaited = tx.savepoint(async (sp) => {
+				await sleep(20);
+				await insert(sp, "committed-with-it");
+			});
+		});
+		assert.equal(await count(db, "committed-with-it"), 1, "it missed the COMMIT");
+		await unawaited;
+
+		const failed = new Error("the transaction failed");
+		await assert.rejects(
+			db.transaction(async (tx) => {
+				unawaited = tx.savepoint(async (sp) => {
+					await sleep(20);
+					await insert(sp, "rolled-back-with-it");
+				});
+				throw failed;
+			}),
+			(error) => error === failed,
+		);
+		await unawaited;
+		assert.equal(
+			await count(db, "rolled-back-with-it"),
+			0,
+			"it ran after the ROLLBACK, outside any transaction",
+		);
+	});
+
+	test("R12: a promise that outlives its savepoint writes in the transaction, outside the savepoint", async (db) => {
+		const boom = new Error("boom");
+		const released = gate();
+		let straggler: Promise<unknown> | undefined;
+		await db.transaction(async (tx) => {
+			await assert.rejects(
+				tx.savepoint(async (sp) => {
+					await insert(sp, "undone");
+					// Started inside the callback and not awaited by it: it carries the
+					// savepoint's context past its end.
+					straggler = released.opened.then(() => insert(db, "late"));
+					throw boom;
+				}),
+				(error) => error === boom,
+			);
+			released.open();
+			await straggler;
+			assert.equal(await count(tx, "late"), 1);
+		});
+		assert.equal(await count(db, "late"), 1);
+		assert.equal(await count(db, "undone"), 0);
+	});
+
+	test("R12: a savepoint in a read-only transaction reads, and a write it refused is undone with it", async (db) => {
+		await insert(db, "seed");
+		await db.transaction(
+			async (tx) => {
+				assert.equal(await tx.savepoint((sp) => count(sp)), 1);
+				await assert.rejects(
+					tx.savepoint((sp) => insert(sp, "written")),
+					READ_ONLY,
+				);
+				// The transaction is as it was: it reads on, and ends without a failure.
+				assert.equal(await count(tx), 1);
+			},
+			{ readOnly: true },
+		);
+		assert.equal(await count(db, "written"), 0);
+		await insert(db, "after");
+		assert.equal(await count(db), 2);
+	});
+
+	test("R12: exclusive inside a savepoint belongs to the transaction, and a savepoint inside exclusive is one", async (db) => {
+		const boom = new Error("boom");
+		await db.transaction(async (tx) => {
+			await assert.rejects(
+				tx.savepoint((sp) =>
+					sp.exclusive("job", async (held) => {
+						await insert(held, "undone");
+						throw boom;
+					}),
+				),
+				(error) => error === boom,
+			);
+			// Taken again, in the same transaction, without waiting for itself.
+			await tx.savepoint((sp) =>
+				sp.exclusive("job", (held) => insert(held, "kept")),
+			);
+		});
+		assert.equal(await count(db, "undone"), 0);
+		assert.equal(await count(db, "kept"), 1);
+
+		// Outside a transaction, inside a section: a transaction of its own there.
+		await db.exclusive("job", async (section) => {
+			await assert.rejects(
+				section.savepoint(async (tx) => {
+					await insert(tx, "section-undone");
+					throw boom;
+				}),
+				(error) => error === boom,
+			);
+			await section.savepoint((tx) => insert(tx, "section-kept"));
+		});
+		assert.equal(await count(db, "section-undone"), 0);
+		assert.equal(await count(db, "section-kept"), 1);
 	});
 
 	// Health (plan doc 03 #3): the one `select 1` a check sends runs on every adapter, and a

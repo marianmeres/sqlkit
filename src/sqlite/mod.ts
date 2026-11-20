@@ -5,7 +5,8 @@
  * It is a backend of the single-connection driver core: one handle is one connection, so
  * every statement takes its turn on it, and a statement runs inside an open transaction
  * only when that transaction's own callback issued it. A transaction is `BEGIN IMMEDIATE`;
- * a read-only one is a deferred `BEGIN` with `PRAGMA query_only` on for its length.
+ * a read-only one is a deferred `BEGIN` with `PRAGMA query_only` on for its length. A
+ * savepoint inside one is SQLite's `SAVEPOINT`.
  *
  * The handle is synchronous, so the driver has a sync tier too: `driver.sync`, the same
  * handle answering at once, with a transaction whose callback is synchronous.
@@ -53,6 +54,7 @@ import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlit
 import { classifySqlite } from "../core/classify-sqlite.ts";
 import type { Driver, QueryResult, Row } from "../core/contract.ts";
 import { toSqlError } from "../core/errors.ts";
+import { savepointBy, savepointBySync } from "../core/savepoint.ts";
 import type {
 	Connection,
 	SingleConnectionBackend,
@@ -526,6 +528,14 @@ function sqliteBackends(
 		if (restrict) db.exec("PRAGMA query_only = OFF");
 	};
 
+	/**
+	 * A savepoint's statements go to the handle as they are, as a transaction's do, not
+	 * through `exec`: none of them is a script that may have changed what a kept statement
+	 * compiles to, and a savepoint that emptied the cache would cost every unit its
+	 * statements. A schema change that a rollback takes back, SQLite recompiles for.
+	 */
+	const control = (text: string): void => db.exec(text);
+
 	const backend: SingleConnectionBackend = {
 		dialect: "sqlite",
 		adapter: "node:sqlite",
@@ -550,6 +560,10 @@ function sqliteBackends(
 			} finally {
 				end(restrict);
 			}
+		},
+
+		savepoint<T>(fn: () => Promise<T>, _inner: Connection, name: string): Promise<T> {
+			return savepointBy(control, name, fn);
 		},
 
 		classify: classifySqlite,
@@ -577,6 +591,9 @@ function sqliteBackends(
 			} finally {
 				end(restrict);
 			}
+		},
+		savepoint<T>(fn: () => T, name: string): T {
+			return savepointBySync(control, name, fn);
 		},
 	};
 

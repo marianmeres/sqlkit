@@ -11,6 +11,8 @@
 //   since the lock is keyed by both.
 // - **A pool of one** runs a section's statements, transactions and nested sections on its
 //   one connection, rather than waiting for a second connection it will never get.
+// - **A lock taken inside a savepoint** is released by Postgres when the savepoint is
+//   rolled back to, and held to the transaction's end when it is released.
 //
 // Suite names start with `pg/`: `pnpm run test:pg` selects them by it.
 
@@ -129,6 +131,56 @@ describe("pg/exclusive", () => {
 				await held;
 				await elsewhere?.dispose();
 			}
+		}));
+
+	test("a lock taken inside a savepoint goes with it when it is undone, and is the transaction's when it is kept", () =>
+		withTwoPools(async ({ driver: one }, two) => {
+			const boom = new Error("boom");
+			const seen: string[] = [];
+			let waiting: Promise<unknown> | undefined;
+			await one.transaction(async (tx) => {
+				await assert.rejects(
+					tx.savepoint((sp) =>
+						sp.exclusive("lock", async () => {
+							throw boom;
+						}),
+					),
+					(error) => error === boom,
+				);
+				// Undone: Postgres let the transaction-scoped lock go with the savepoint,
+				// so another pool takes it while this transaction is still open.
+				await Promise.race([
+					two.exclusive("lock", async () => {
+						seen.push("two, while one's transaction is open");
+					}),
+					sleep(2_000).then(() =>
+						assert.fail("the lock outlived its savepoint"),
+					),
+				]);
+				await tx.savepoint((sp) =>
+					sp.exclusive("lock", async () => {
+						seen.push("one, again");
+					}),
+				);
+				// Kept: the transaction holds it from here to its end, and takes it again
+				// without waiting for itself.
+				await tx.exclusive("lock", async () => {
+					seen.push("one, re-entrant");
+				});
+				waiting = two.exclusive("lock", async () => {
+					seen.push("two, after one's transaction");
+				});
+				await sleep(100);
+				seen.push("one's transaction ends");
+			});
+			await waiting;
+			assert.deepEqual(seen, [
+				"two, while one's transaction is open",
+				"one, again",
+				"one, re-entrant",
+				"one's transaction ends",
+				"two, after one's transaction",
+			]);
 		}));
 
 	test("a pool of one runs a section's statements and transactions on its client", () =>

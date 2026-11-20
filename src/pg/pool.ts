@@ -18,6 +18,17 @@
  * of its own like any other caller, rather than writing on a client that has gone back to
  * the pool and may already be pinned by somebody else's transaction.
  *
+ * `savepoint()` inside a transaction is `SAVEPOINT` on the pinned client, then `RELEASE`,
+ * or `ROLLBACK TO` when its callback rejected. Its callback runs in a context of its own:
+ * a statement runs inside the savepoint only when that callback issued it, and whatever
+ * the enclosing transaction issues meanwhile, another savepoint included, waits on the
+ * client for the savepoint to end. A transaction, and a savepoint, ends only once the
+ * savepoints opened in it have: one that was not awaited would otherwise run on after
+ * the `COMMIT`. A `RELEASE` Postgres refuses because a statement inside failed and the
+ * callback swallowed the error is turned into a `ROLLBACK TO`, which recovers the
+ * transaction, and a `TransactionAbortedError`. Outside a transaction `savepoint()` is
+ * `transaction()`.
+ *
  * `exclusive()` pins a connection too, for a different reason: it holds a **session
  * advisory lock** keyed by the lock name and `current_schema()` (two schemas are two
  * deployments, and the test suite runs a schema per case), and every statement its
@@ -68,14 +79,16 @@ import {
 	statementOf,
 	type TransactionOptions,
 } from "../core/contract.ts";
-import { toSqlError } from "../core/errors.ts";
+import { TransactionAbortedError, toSqlError } from "../core/errors.ts";
 import { normalizeParams } from "../core/params.ts";
+import { savepointBy, savepointName } from "../core/savepoint.ts";
 import type { Sql } from "../core/sql.ts";
 import { type LockKey, type LockStatement, lockKeyOf, takeLock, unlock } from "./lock.ts";
 import {
 	BEGIN_READ_ONLY,
 	describe,
 	notCommitted,
+	notKept,
 	resultOf,
 	searchPathOf,
 } from "./session.ts";
@@ -88,20 +101,36 @@ import type {
 } from "./types.ts";
 
 /**
- * A pinned client and what it is pinned for: a transaction, or an `exclusive` section
- * holding a session advisory lock. One object per pin, shared by every context that
- * carries it, so closing it once closes it for all of them.
+ * A pinned client and what it is pinned for: a transaction, a savepoint inside one, or an
+ * `exclusive` section holding a session advisory lock. One object per pin, shared by
+ * every context that carries it, so closing it once closes it for all of them.
  */
 interface Pin {
 	readonly client: PgPoolClientLike;
-	readonly kind: "transaction" | "exclusive";
+	readonly kind: "transaction" | "savepoint" | "exclusive";
 	open: boolean;
-	/** The section a transaction was opened inside, whose client it runs on. */
+	/**
+	 * The section a transaction was opened inside, whose client it runs on; the
+	 * transaction or the savepoint a savepoint was opened in.
+	 */
 	readonly parent: Pin | undefined;
 	/** The lock names held on this pin: until the section ends, or the transaction does. */
 	readonly held: Set<string>;
-	/** A section's own statements and transactions take turns on its one client. */
+	/**
+	 * What takes turns on the pin's client. In a section: its own statements and
+	 * transactions. In a transaction or a savepoint: a savepoint opened in it, and what
+	 * was issued there after.
+	 */
 	turn: Promise<unknown>;
+	/** How many of those have not settled. */
+	waiting: number;
+	/** How many savepoints deep: 0 for a transaction and for a section. */
+	readonly depth: number;
+}
+
+/** Whether a pin is a transaction or a savepoint of one: its client is inside a transaction. */
+function inTransaction(pin: Pin | undefined): boolean {
+	return pin !== undefined && pin.kind !== "exclusive";
 }
 
 const settled = (): undefined => undefined;
@@ -228,11 +257,40 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 	/** Sections whose connection a failed `ROLLBACK` left in an unknown state. */
 	const brokenSections = new WeakMap<Pin, Error>();
 
-	/** Run `work` on a section's client after everything queued there before it. */
-	const onTurn = <T>(section: Pin, work: () => Promise<T>): Promise<T> => {
-		const run = section.turn.then(work, work);
-		section.turn = run.then(settled, settled);
+	/**
+	 * Run `work` on a pin's client after everything that took a turn there before it. It
+	 * no longer counts as waiting by the time its answer is out.
+	 */
+	const onTurn = <T>(pin: Pin, work: () => Promise<T>): Promise<T> => {
+		pin.waiting++;
+		const run = pin.turn.then(async () => {
+			try {
+				return await work();
+			} finally {
+				pin.waiting--;
+			}
+		});
+		pin.turn = run.then(settled, settled);
 		return run;
+	};
+
+	/**
+	 * `work` in an open transaction or savepoint: at once, or in its turn while a
+	 * savepoint opened there runs or anything waits for one. It then neither runs inside
+	 * that savepoint nor goes with its rollback.
+	 */
+	const inScope = <T>(scope: Pin, work: () => Promise<T>): Promise<T> =>
+		scope.waiting > 0 ? onTurn(scope, work) : work();
+
+	/**
+	 * End a transaction or a savepoint whose callback has settled. Whatever the callback
+	 * left running is in the enclosing pin from here on, or takes a connection of its own.
+	 * A savepoint opened in it and not awaited, and what waits behind one, finishes first:
+	 * it would otherwise run on after the `COMMIT`, outside any transaction.
+	 */
+	const leave = async (scope: Pin): Promise<void> => {
+		scope.open = false;
+		while (scope.waiting > 0) await scope.turn;
 	};
 
 	/** Run `work` on a connection of its own, checked out for it and released after. */
@@ -257,9 +315,10 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		// a section the same holds, and the statement waits for any transaction open on
 		// the section's client rather than landing inside it.
 		const pin = currentPin();
-		if (pin?.kind === "transaction") return run<T>(pin.client, text, values);
-		if (pin !== undefined) return onTurn(pin, () => run<T>(pin.client, text, values));
-		return onOwnClient((client) => run<T>(client, text, values));
+		if (pin === undefined)
+			return onOwnClient((client) => run<T>(client, text, values));
+		const work = (): Promise<QueryResult<T>> => run<T>(pin.client, text, values);
+		return pin.kind === "exclusive" ? onTurn(pin, work) : inScope(pin, work);
 	};
 
 	const exec = async (script: string): Promise<void> => {
@@ -271,9 +330,9 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 			await send(client, script);
 		};
 		const pin = currentPin();
-		if (pin?.kind === "transaction") return runScript(pin.client);
-		if (pin !== undefined) return onTurn(pin, () => runScript(pin.client));
-		return onOwnClient(runScript);
+		if (pin === undefined) return onOwnClient(runScript);
+		const work = (): Promise<void> => runScript(pin.client);
+		return pin.kind === "exclusive" ? onTurn(pin, work) : inScope(pin, work);
 	};
 
 	/**
@@ -295,6 +354,8 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 			parent,
 			held: new Set(),
 			turn: Promise.resolve(),
+			waiting: 0,
+			depth: 0,
 		};
 		// Set once the server has ended the transaction itself: no ROLLBACK to send.
 		let ended = false;
@@ -307,7 +368,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 				} finally {
 					// Before COMMIT or ROLLBACK: whatever the callback left running takes
 					// a connection of its own from here on.
-					tx.open = false;
+					await leave(tx);
 				}
 				const { command } = await send(client, "commit");
 				if (command !== "COMMIT") {
@@ -341,7 +402,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		assertCallback(fn, "transaction(fn)");
 		const pin = currentPin();
 		// Nested: the open transaction is the transaction, as it was opened.
-		if (pin?.kind === "transaction") return fn(driver);
+		if (inTransaction(pin)) return fn(driver);
 		// Inside a section: on the section's client, when its turn comes.
 		if (pin !== undefined) {
 			const section = pin;
@@ -360,6 +421,68 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		} finally {
 			client.release(broken);
 		}
+	};
+
+	/**
+	 * `fn` in a savepoint of `parent`, on its client, in a context of its own. Called in
+	 * `parent`'s turn: nothing else of that transaction runs until it has settled.
+	 */
+	const runSavepoint = async <T>(
+		parent: Pin,
+		fn: (tx: Driver) => Promise<T>,
+	): Promise<T> => {
+		const { client } = parent;
+		const scope: Pin = {
+			client,
+			kind: "savepoint",
+			open: true,
+			parent,
+			held: new Set(),
+			turn: Promise.resolve(),
+			waiting: 0,
+			depth: parent.depth + 1,
+		};
+		// Set once the callback resolved: a refusal after that is the savepoint's own.
+		let resolved = false;
+		let result: T;
+		try {
+			result = await savepointBy(
+				(text) => send(client, text),
+				savepointName(scope.depth),
+				async () => {
+					let value: T;
+					try {
+						value = await pinned.run(scope, () => fn(driver));
+					} finally {
+						// Before RELEASE or ROLLBACK TO: whatever the callback left
+						// running is in the enclosing transaction from here on.
+						await leave(scope);
+					}
+					resolved = true;
+					return value;
+				},
+			);
+		} catch (error) {
+			// Postgres refuses to release a savepoint in a transaction a failed statement
+			// aborted: the callback caught that statement's error and resolved. It has
+			// been rolled back to, which recovered the transaction.
+			if (resolved && error instanceof TransactionAbortedError)
+				throw notKept(error);
+			throw error;
+		}
+		// A lock taken inside a savepoint that was kept is the transaction's, to its end.
+		for (const name of scope.held) parent.held.add(name);
+		return result;
+	};
+
+	const savepoint = async <T>(fn: (tx: Driver) => Promise<T>): Promise<T> => {
+		assertCallback(fn, "savepoint(fn)");
+		const pin = currentPin();
+		// Outside a transaction there is none to save a point in: the unit is one.
+		if (pin === undefined || pin.kind === "exclusive") return transaction(fn);
+		// In its turn: after a savepoint opened there before it, and before whatever the
+		// transaction issues next.
+		return onTurn(pin, () => runSavepoint(pin, fn));
 	};
 
 	/** Lock statements on `client`, each guarded, and each in its turn when one is given. */
@@ -382,10 +505,11 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		if (holds(pin, name)) return fn(driver);
 
 		// Inside a transaction: the transaction holds it, to its end. Postgres cannot
-		// release a transaction-scoped lock any earlier.
-		if (pin?.kind === "transaction") {
+		// release a transaction-scoped lock any earlier, except with the savepoint it was
+		// taken in, when that is rolled back to.
+		if (pin !== undefined && pin.kind !== "exclusive") {
 			const tx = pin;
-			const statement = lockStatement(tx.client);
+			const statement = lockStatement(tx.client, (work) => inScope(tx, work));
 			const key = await lockKeyOf(statement, name);
 			await takeLock(statement, key, "transaction");
 			tx.held.add(name);
@@ -417,6 +541,8 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 			parent: undefined,
 			held: new Set([name]),
 			turn: Promise.resolve(),
+			waiting: 0,
+			depth: 0,
 		};
 		// Set when the connection must be destroyed rather than reused: destroying it is
 		// also what releases a session lock that could not be released by statement.
@@ -474,6 +600,7 @@ export function createPgDriver(pool: PgPoolLike, options?: PgDriverOptions): Dri
 		query,
 		exec,
 		transaction,
+		savepoint,
 		exclusive,
 		close,
 	};

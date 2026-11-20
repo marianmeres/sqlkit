@@ -120,14 +120,16 @@ if (error.code === "23505" || /UNIQUE constraint failed/.test(error.message)) �
 
 ## Anti-Patterns
 
-| Anti-pattern                                      | Instead                                                       |
-| ------------------------------------------------- | ------------------------------------------------------------- |
-| `BEGIN` / `COMMIT` sent through `query`           | `db.transaction(fn)`                                          |
-| `withRetry` around part of a transaction          | around a whole `transaction` call or one idempotent statement |
-| Async work inside `db.sync.transaction`           | the async tier's `transaction`                                |
-| SQLite as a test stand-in for a Postgres app      | PGlite (`./pglite`)                                           |
-| A behaviour tested on one adapter only            | a case in a conformance body                                  |
-| `import … from "pg"` (or any driver) under `src/` | a structural `<Name>Like` type                                |
+| Anti-pattern                                                                    | Instead                                                                    |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `BEGIN` / `COMMIT` sent through `query`                                         | `db.transaction(fn)`                                                       |
+| `SAVEPOINT` / `ROLLBACK TO` sent through `query`                                | `tx.savepoint(fn)`: it is undone for you, and runs on Durable Objects      |
+| `withRetry` around part of a transaction                                        | around a whole `transaction` call or one idempotent statement              |
+| A `try`/`catch` around a statement in a Postgres transaction, to go on after it | `tx.savepoint(fn)` around it: the failed statement aborted the transaction |
+| Async work inside `db.sync.transaction`                                         | the async tier's `transaction`                                             |
+| SQLite as a test stand-in for a Postgres app                                    | PGlite (`./pglite`)                                                        |
+| A behaviour tested on one adapter only                                          | a case in a conformance body                                               |
+| `import … from "pg"` (or any driver) under `src/`                               | a structural `<Name>Like` type                                             |
 
 ## Testing
 

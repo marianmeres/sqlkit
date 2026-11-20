@@ -16,8 +16,9 @@ What it is:
 
 - **SQL fragments.** A tagged template binds every value and composes: a fragment inside
   a fragment is spliced, and placeholders (`$1` or `?`) are written last.
-- **One driver contract.** `query`, `exec`, `transaction`, `exclusive`, `close`, the same
-  on every adapter, plus a synchronous tier where the engine is synchronous.
+- **One driver contract.** `query`, `exec`, `transaction`, `savepoint`, `exclusive`,
+  `close`, the same on every adapter, plus a synchronous tier where the engine is
+  synchronous.
 - **Typed errors.** A unique violation is a `UniqueViolationError` on every database, with
   the driver's error kept as `cause`.
 - **Conventions on top:** statement builders, explicit row decoders, retry, health checks
@@ -134,7 +135,8 @@ export class Room extends DurableObject {
 
 The storage of a SQLite-backed Durable Object. The Worker needs the `nodejs_compat`
 compatibility flag: the driver carries a transaction in `AsyncLocalStorage`. `db.sync` is
-the same storage, synchronously, and its `transaction` is `storage.transactionSync`.
+the same storage, synchronously, and its `transaction` is `storage.transactionSync`. A
+savepoint is the storage's own transaction, nested in the open one.
 Where workerd differs from node:sqlite:
 
 - **An async transaction holds the whole object.** While it is open, no other request
@@ -143,7 +145,8 @@ Where workerd differs from node:sqlite:
 - **`query` cannot refuse a text of several statements**: workerd runs every statement of
   a text given no values. Pass one statement to `query`, a script to `exec`.
 - **A script cannot hold its own transaction**: workerd refuses `BEGIN`, `SAVEPOINT`,
-  `COMMIT` and `ROLLBACK`, a migration file's included. `transaction` is the way.
+  `COMMIT` and `ROLLBACK`, a migration file's included. `transaction` and `savepoint` are
+  the way.
 - **A read-only transaction detects a write after it ran** (workerd does not authorize
   `PRAGMA query_only`) and rolls the transaction back, rejecting with a `ReadOnlyError`
   even when the callback caught the first one. DDL that is not the last statement of a
@@ -214,6 +217,31 @@ const id = await db.transaction(async (tx) => {
   advisory lock every process on the database honours (`capabilities.crossProcessLock`);
   on SQLite, PGlite and Durable Objects it is a queue in this process.
 
+### Savepoints
+
+```ts
+await db.transaction(async (tx) => {
+	for (const row of rows) {
+		try {
+			await tx.savepoint((sp) => sp.query(insert("item", row)));
+		} catch (error) {
+			if (!(error instanceof UniqueViolationError)) throw error;
+			skipped.push(row); // this row is undone, the rows before it stay
+		}
+	}
+});
+```
+
+- `savepoint(fn)` runs `fn` as a unit of the open transaction: kept when it resolves,
+  undone alone when it rejects, and the transaction goes on either way. On Postgres it is
+  how a transaction survives a failed statement.
+- Outside a transaction it is a transaction of its own. A library that is handed a driver
+  calls it for an all-or-nothing unit, whether or not its caller opened a transaction.
+- Savepoints nest. Two opened at once in one transaction run one after the other, and a
+  statement the transaction issues while one is open waits for it to end.
+- The same on every adapter: `SAVEPOINT` on SQLite and Postgres, the storage's nested
+  transaction on Durable Objects. `db.sync` has it too.
+
 ## The sync tier
 
 An async callback returns at its first `await`, so it cannot run inside a synchronous
@@ -227,10 +255,12 @@ const count = db.sync?.transaction((tx) => {
 });
 ```
 
+`db.sync.savepoint(fn)` is the savepoint with a synchronous callback.
+
 The two tiers share one connection, so each refuses what would land in the wrong
 transaction, with a `TypeError`: a sync callback that returns a promise, an async call
-from inside a sync transaction, and a sync call while an async transaction is open,
-unless it comes from that transaction's own callback. The rules (S1–S6) are in
+from inside a sync transaction or savepoint, and a sync call while an async transaction
+is open, unless it comes from that transaction's own callback. The rules (S1–S6) are in
 [API.md](./API.md#syncdriver).
 
 ## Errors
@@ -342,8 +372,9 @@ await migrate.up();
 ```
 
 - `createMigrate` is an [`@marianmeres/migrate`](https://www.npmjs.com/package/@marianmeres/migrate)
-  instance whose run lock, step transactions and version table are the driver's. A worker
-  receives the driver as `db`; what it issues runs inside the step's transaction.
+  instance whose run lock, steps and version table are the driver's. A worker receives the
+  driver as `db`; what it issues runs inside its step, and is undone with it.
+- A step that fails is undone alone, and the steps before it stay, on every adapter.
 - `addSqlFiles` (Node only) registers `<version>[__<label>].up.sql` and `.down.sql` files;
   each file is one `exec`, so it may hold several statements. A version with no down file
   is irreversible.
@@ -369,15 +400,19 @@ await migrate.up();
   waits for the transaction, and the transaction waits for it. The context follows
   `await`; bind such a callback inside the transaction (`AsyncLocalStorage.bind`). A pool
   does not wait, but that statement runs outside the transaction there too.
+- **A savepoint can wait for itself the same way,** on every adapter, a pool included.
+  What a transaction issues while a savepoint is open waits for the savepoint, so a
+  savepoint's callback must not await a statement that was issued outside it.
 - **`withRetry` runs the whole function again.** Put it around one idempotent statement
   or a whole `transaction` call, never around part of a transaction: on Postgres the
   transaction is already aborted, and anywhere the statements before the failure are
   still in it.
 - **Migrations lock in one of two ways.** Where the driver's lock crosses processes
-  (`createPgDriver`, `createPgClientDriver`) a run holds an advisory lock and commits step
-  by step: a failed step is undone alone. Elsewhere (node:sqlite, PGlite, Durable Objects)
-  the run is one transaction: a failed step undoes the whole run, the steps before it
-  included.
+  (`createPgDriver`, `createPgClientDriver`) a run holds an advisory lock and each step is
+  a transaction of its own. Elsewhere (node:sqlite, PGlite, Durable Objects) the run is
+  one transaction and each step a savepoint of it, so a long run holds the database's
+  write lock for its whole length. Either way a failed step is undone alone. Up to 0.2.0
+  it undid the whole run on the second kind.
 - **One active version is stored, not a ledger of applied steps.** `up()` runs the
   versions above the active one, in semver order. A version added later _below_ the
   active one is never applied, and never reported as pending.

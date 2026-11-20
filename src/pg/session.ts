@@ -1,7 +1,8 @@
 /**
  * What both Postgres drivers do on one session, written once: how a read-only transaction
- * begins, how a `COMMIT` that did not commit is refused, how a statement's result is read,
- * and how the `schema` option becomes a `search_path`. The pool driver does it on a
+ * begins, how a `COMMIT` that did not commit and a savepoint that could not be kept are
+ * refused, how a statement's result is read, and how the `schema` option becomes a
+ * `search_path`. The pool driver does it on a
  * connection it checked out, the client driver on the one it was given.
  */
 
@@ -27,6 +28,23 @@ export function notCommitted(command: string): TransactionAbortedError {
 			"and returned as if it had succeeded",
 		"pg",
 		{ kind: "aborted" },
+	);
+}
+
+/**
+ * What a savepoint Postgres would not release is refused with: a statement inside it
+ * failed and aborted the transaction, and the callback caught that statement's error and
+ * resolved. `refusal` is the release's, which says no more than that the transaction was
+ * aborted; the statement's own error went to the callback that caught it.
+ */
+export function notKept(refusal: unknown): TransactionAbortedError {
+	return new TransactionAbortedError(
+		"a statement inside the savepoint failed, and Postgres aborted the transaction " +
+			"with it: the savepoint was rolled back to, not kept. The callback caught that " +
+			"statement's error and returned as if it had succeeded",
+		"pg",
+		{ kind: "aborted" },
+		refusal,
 	);
 }
 

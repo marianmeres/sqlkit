@@ -160,6 +160,50 @@ describe("sqlite/statement-cache: what is kept", () => {
 		}
 	});
 
+	test("a savepoint, kept or undone, runs the statements kept and empties nothing", async (t) => {
+		// Its `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` go to the handle as a transaction's
+		// statements do, not through `exec`, which would empty the cache each time.
+		const compiled = countCompiles(t);
+		const boom = new Error("boom");
+		const db = openSqlite();
+		try {
+			await db.exec("create table item (id integer primary key, name text)");
+			const insert = "insert into item (name) values (?)";
+			await db.query(insert, ["a"]);
+			await db.transaction(async (tx) => {
+				await tx.savepoint((sp) => sp.query(insert, ["b"]));
+				await assert.rejects(
+					tx.savepoint(async (sp) => {
+						await sp.query(insert, ["undone"]);
+						throw boom;
+					}),
+					(error) => error === boom,
+				);
+			});
+			db.sync?.transaction((tx) => {
+				tx.savepoint((sp) => sp.query(insert, ["c"]));
+				assert.throws(
+					() =>
+						tx.savepoint((sp) => {
+							sp.query(insert, ["undone"]);
+							throw boom;
+						}),
+					(error) => error === boom,
+				);
+			});
+			await db.query(insert, ["d"]);
+			assert.deepEqual((await db.query("select name from item order by id")).rows, [
+				{ name: "a" },
+				{ name: "b" },
+				{ name: "c" },
+				{ name: "d" },
+			]);
+			assert.equal(compiled(insert), compiles(6));
+		} finally {
+			await db.close();
+		}
+	});
+
 	test("the least recently used statement is dropped past statementCache", async (t) => {
 		const compiled = countCompiles(t);
 		const db = openSqlite(":memory:", { statementCache: 2 });
@@ -475,6 +519,88 @@ describe("sqlite/statement-cache: a kept statement answers as a new one would", 
 				(await db.query("select count(*) as n from aux.item")).rows,
 				[{ n: 2 }],
 			);
+		} finally {
+			await db.close();
+		}
+	});
+
+	test("after a savepoint, or a transaction, took back the schema it was compiled under", async () => {
+		// Nothing of the driver's empties the cache here: SQLite recompiles every
+		// statement of the connection once a rollback has taken a schema change back.
+		const boom = new Error("boom");
+		const db = openSqlite();
+		try {
+			await db.exec("create table item (a integer); insert into item values (1)");
+			const select = "select * from item";
+			assert.deepEqual((await db.query(select)).rows, [{ a: 1 }]);
+			/** Change the schema, read under it, and fail: the unit around it is undone. */
+			const change = async (inner: Driver): Promise<never> => {
+				await inner.exec("alter table item add column b text default 'x'");
+				// Compiled, and kept, under the schema about to be taken back.
+				assert.deepEqual((await inner.query(select)).rows, [{ a: 1, b: "x" }]);
+				throw boom;
+			};
+			// A savepoint undone, inside a transaction that goes on and commits.
+			await db.transaction(async (tx) => {
+				await assert.rejects(tx.savepoint(change), (error) => error === boom);
+				assert.deepEqual((await tx.query(select)).rows, [{ a: 1 }]);
+			});
+			assert.deepEqual((await db.query(select)).rows, [{ a: 1 }]);
+			// A whole transaction rolled back.
+			await assert.rejects(db.transaction(change), (error) => error === boom);
+			assert.deepEqual((await db.query(select)).rows, [{ a: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	test("after a savepoint took back the table that stood in front of an attached one, or its drop", async () => {
+		const boom = new Error("boom");
+		const db = openSqlite();
+		try {
+			await db.exec(
+				"attach ':memory:' as aux;" +
+					"create table aux.item (src text);" +
+					"insert into aux.item (src) values ('aux')",
+			);
+			const read = "select src from item order by rowid";
+			assert.deepEqual((await db.query(read)).rows, [{ src: "aux" }]);
+
+			// Made in `main` inside a savepoint that is undone: the name means the
+			// attached one again.
+			await db.transaction(async (tx) => {
+				await assert.rejects(
+					tx.savepoint(async (sp) => {
+						await sp.exec(
+							"create table item (src text); insert into item values ('main')",
+						);
+						assert.deepEqual((await sp.query(read)).rows, [{ src: "main" }]);
+						throw boom;
+					}),
+					(error) => error === boom,
+				);
+				assert.deepEqual((await tx.query(read)).rows, [{ src: "aux" }]);
+			});
+			assert.deepEqual((await db.query(read)).rows, [{ src: "aux" }]);
+
+			// Dropped from `main` inside a savepoint that is undone: it is in front again.
+			await db.exec(
+				"create table item (src text); insert into item values ('main')",
+			);
+			assert.deepEqual((await db.query(read)).rows, [{ src: "main" }]);
+			db.sync?.transaction((tx) => {
+				assert.throws(
+					() =>
+						tx.savepoint((sp) => {
+							sp.exec("drop table item");
+							assert.deepEqual(sp.query(read).rows, [{ src: "aux" }]);
+							throw boom;
+						}),
+					(error) => error === boom,
+				);
+				assert.deepEqual(tx.query(read).rows, [{ src: "main" }]);
+			});
+			assert.deepEqual((await db.query(read)).rows, [{ src: "main" }]);
 		} finally {
 			await db.close();
 		}

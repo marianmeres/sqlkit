@@ -22,6 +22,17 @@
  * A nested `transaction()` joins the open one, as it was opened. The backend is asked for
  * a transaction only at the top level, in the connection's turn.
  *
+ * **A savepoint is a scope of its own inside the transaction.** `savepoint()` inside an
+ * open transaction asks the backend for a savepoint and runs its callback in a context of
+ * its own, so the rule above holds one level down: a statement runs inside the savepoint
+ * only when the savepoint's own callback issued it. Whatever the enclosing scope issues
+ * meanwhile (a statement, a script, a lock, another savepoint) waits for the savepoint to
+ * end, in the order it was issued, so it neither runs inside it nor goes with its
+ * rollback. A scope that ends waits first for what its context sent and did not await, a
+ * savepoint included: nothing of a transaction is still running when the backend commits
+ * it or rolls it back. A context that outlived its savepoint is in the enclosing scope.
+ * Outside a transaction `savepoint()` is `transaction()`.
+ *
  * **A transaction Postgres aborted is not committed.** On the `pg` dialect a failed
  * statement aborts the whole transaction: every statement after it fails, and the `COMMIT`
  * is answered with `ROLLBACK`, without an error. A callback that caught the failure and
@@ -32,7 +43,10 @@
  * instead of committing. A statement that succeeds after a failure means the transaction
  * was recovered (a `rollback to savepoint` is the one that can), so it clears the count.
  * It is the one piece of dialect knowledge the core has: SQLite undoes the failed
- * statement alone, and commits the rest.
+ * statement alone, and commits the rest. The count is kept per scope: a savepoint whose
+ * callback swallowed a failure is rolled back to rather than released, which recovers
+ * the transaction, and rejects the same way. A savepoint the database would not open,
+ * release or roll back to counts as a failure of the scope it was opened in.
  *
  * `exclusive()` is an in-process queue per lock name and, where the backend has a lock
  * other processes honour (`backend.lock`), that lock too, taken once the queue lets a
@@ -56,19 +70,22 @@
  * answering at once, with a transaction whose callback is synchronous. The two tiers share
  * the connection, so each refuses what would land in the wrong transaction (D16):
  *
- * - **S1** A `sync.transaction` callback that returns a thenable is a `TypeError`, and its
- *   transaction is rolled back: an async callback returns at its first `await`, before
- *   the rest of it has run.
+ * - **S1** A `sync.transaction` or `sync.savepoint` callback that returns a thenable is a
+ *   `TypeError`, and it is undone: an async callback returns at its first `await`,
+ *   before the rest of it has run.
  * - **S2** A nested `sync.transaction` joins the open one, as it was opened.
  * - **S3** A sync call from inside an open async transaction's own context runs inside
- *   that transaction; a `sync.transaction` there joins it.
+ *   that transaction; a `sync.transaction` there joins it, and a `sync.savepoint` there
+ *   is a savepoint of it.
  * - **S4** A sync call while an async transaction is open, from any other context, is a
  *   `TypeError`: it could only run inside a transaction it does not belong to. "Open"
  *   lasts until the backend has committed or rolled back, so a promise that outlived the
- *   callback is refused too.
- * - **S5** An async call (`query`, `exec`, `transaction`, `exclusive`, `close`) from inside
- *   a sync transaction's callback rejects with a `TypeError`: it could only run after
- *   the callback returned, outside the transaction.
+ *   callback is refused too. A sync call from the transaction's own context is refused
+ *   the same way while a savepoint opened there is running, or anything waits for one:
+ *   it cannot wait its turn, and would run inside that savepoint.
+ * - **S5** An async call (`query`, `exec`, `transaction`, `savepoint`, `exclusive`,
+ *   `close`) from inside a sync transaction's or savepoint's callback rejects with a
+ *   `TypeError`: it could only run after the callback returned, outside it.
  * - **S6** A sync call while async statements are queued, but no transaction is open,
  *   runs at once, ahead of them.
  *
@@ -93,6 +110,7 @@ import {
 } from "../core/contract.ts";
 import { TransactionAbortedError, toSqlError } from "../core/errors.ts";
 import { normalizeParams } from "../core/params.ts";
+import { savepointName } from "../core/savepoint.ts";
 import type { Sql } from "../core/sql.ts";
 import type {
 	Connection,
@@ -102,20 +120,31 @@ import type {
 } from "./backend.ts";
 
 /**
- * The transaction a context belongs to. One object per transaction, shared by every
- * context that carries it, so closing it once closes it for all of them.
+ * What a context's statements belong to: a transaction, or a savepoint inside one. One
+ * object per scope, shared by every context that carries it, so closing it once closes it
+ * for all of them.
  */
-interface OpenTransaction {
+interface Scope {
+	/** True while its callback runs. A context whose scope ended is in the enclosing one. */
 	open: boolean;
+	/** The scope a savepoint was opened in; none for a transaction. */
+	readonly parent: Scope | undefined;
 	/** What the backend handed the transaction's callback: its statements go there. */
 	readonly connection: Connection;
 	/**
-	 * `pg` only: the failure that aborted the transaction, while no statement since has
-	 * succeeded.
+	 * `pg` only: the failure that aborted the transaction while this scope was the one
+	 * running, as long as no statement since has succeeded.
 	 */
 	failure: Thrown | undefined;
-	/** `pg` only: what the transaction's context sent on its connection, until it settles. */
+	/**
+	 * What this scope's context sent and has not settled: a savepoint, whatever waited
+	 * for one, and on `pg` every statement. The scope does not end before they have.
+	 */
 	readonly pending: Set<Promise<unknown>>;
+	/** The tail of what takes turns in this scope: a savepoint, and what was issued after. */
+	turn: Promise<unknown>;
+	/** How many of those have not settled. Above 0, a call in this scope waits its turn. */
+	waiting: number;
 }
 
 /**
@@ -202,27 +231,79 @@ export function createSingleConnectionDriver(
 		crossProcessLock: lock !== undefined,
 	});
 
-	const current = new AsyncLocalStorage<OpenTransaction>();
+	const current = new AsyncLocalStorage<Scope>();
 	let queue: Promise<unknown> = Promise.resolve();
 	/** An async transaction is open on the connection: from its start until it settled. */
 	let asyncOpen = false;
 	/** How many sync transaction callbacks are running: above 0, the caller is in one. */
 	let syncDepth = 0;
+	/** How many savepoints are open on the connection, on either tier: they are one stack. */
+	let savepoints = 0;
 
-	/** S5: an async call from inside a sync transaction's callback, refused. */
+	/** S5: an async call from inside a sync transaction's or savepoint's callback, refused. */
 	const insideSync = (call: string): TypeError | undefined =>
 		syncDepth > 0
 			? new TypeError(
-					`${call} cannot be called inside a sync transaction: it could only run ` +
-						"after the callback returned, outside the transaction. Use the sync " +
-						"tier there (tx.query, tx.exec, tx.transaction)",
+					`${call} cannot be called inside a sync transaction or savepoint: it ` +
+						"could only run after the callback returned, outside it. Use the sync " +
+						"tier there (tx.query, tx.exec, tx.transaction, tx.savepoint)",
 				)
 			: undefined;
 
-	/** Only the open transaction's own context; one whose transaction ended is none. */
-	const openTransaction = (): OpenTransaction | undefined => {
-		const tx = current.getStore();
-		return tx?.open === true ? tx : undefined;
+	/**
+	 * The scope this context is in: the innermost one still open. A context that outlived
+	 * its savepoint is in the scope around it, and one whose transaction ended is in none.
+	 */
+	const openScope = (): Scope | undefined => {
+		let scope = current.getStore();
+		while (scope !== undefined && !scope.open) scope = scope.parent;
+		return scope;
+	};
+
+	/** A scope about to open: a transaction on `connection`, or a savepoint in `parent`. */
+	const scopeOn = (connection: Connection, parent: Scope | undefined): Scope => ({
+		open: true,
+		parent,
+		connection,
+		failure: undefined,
+		pending: new Set(),
+		turn: Promise.resolve(),
+		waiting: 0,
+	});
+
+	/** Have `scope` wait for `sent` before it ends. */
+	const track = (scope: Scope, sent: Promise<unknown>): void => {
+		const done = sent.then(settled, settled);
+		scope.pending.add(done);
+		void done.then(() => scope.pending.delete(done));
+	};
+
+	/**
+	 * Run `work` in `scope` after everything that took a turn there before it. It no
+	 * longer counts as waiting by the time its answer is out, so what its caller issues
+	 * next, having awaited it, finds the scope as free as it then is.
+	 */
+	const onTurn = <T>(scope: Scope, work: () => Promise<T>): Promise<T> => {
+		scope.waiting++;
+		const run = scope.turn.then(async () => {
+			try {
+				return await work();
+			} finally {
+				scope.waiting--;
+			}
+		});
+		scope.turn = run.then(settled, settled);
+		return run;
+	};
+
+	/**
+	 * End `scope`, whose callback has settled. Whatever the callback left running is in
+	 * the enclosing scope from here on, or a stranger when there is none. What its context
+	 * had already sent is waited for, so that none of it runs after the scope is gone.
+	 */
+	const leave = async (scope: Scope): Promise<void> => {
+		scope.open = false;
+		while (scope.pending.size > 0) await Promise.all(scope.pending);
 	};
 
 	/** Run `work` after everything queued before it, whatever that answered. */
@@ -248,49 +329,56 @@ export function createSingleConnectionDriver(
 	): Promise<QueryResult<Row>> => guard(() => connection.run(text, params));
 
 	/**
-	 * `call`, sent on the open transaction `tx`. On `pg` its outcome is counted: a failure
-	 * aborted the transaction, and a statement's success after one recovered it. A lock's
-	 * success does not count, since a backend may take or release it without a statement.
-	 * A `TypeError` is a refusal, not the database's answer, and counts for neither.
+	 * `call`, sent in the open scope `scope`: at once, or in its turn while a savepoint
+	 * opened there runs or anything waits for one. On `pg` its outcome is counted: a
+	 * failure aborted the transaction, and a statement's success after one recovered it.
+	 * A lock's success does not count, since a backend may take or release it without a
+	 * statement. A `TypeError` is a refusal, not the database's answer, and counts for
+	 * neither.
 	 */
-	const inTransaction = <T>(
-		tx: OpenTransaction,
+	const inScope = <T>(
+		scope: Scope,
 		call: () => Promise<T>,
 		statement = true,
 	): Promise<T> => {
-		if (!abortsOnFailure) return call();
-		const answer = call().then(
+		const waits = scope.waiting > 0;
+		const sent = waits ? onTurn(scope, call) : call();
+		if (!abortsOnFailure) {
+			if (waits) track(scope, sent);
+			return sent;
+		}
+		const answer = sent.then(
 			(value) => {
-				if (statement) tx.failure = undefined;
+				if (statement) scope.failure = undefined;
 				return value;
 			},
 			(error: unknown) => {
-				if (!(error instanceof TypeError)) tx.failure ??= { error };
+				if (!(error instanceof TypeError)) scope.failure ??= { error };
 				throw error;
 			},
 		);
-		const done = answer.then(settled, settled);
-		tx.pending.add(done);
-		void done.then(() => tx.pending.delete(done));
+		track(scope, answer);
 		return answer;
 	};
 
 	/**
-	 * `pg`: wait for what the transaction's context sent and did not await, then refuse
-	 * to commit a transaction a failure aborted. Called once its callback resolved, so
-	 * nothing new is added meanwhile: the context is no longer the transaction's.
+	 * `pg`: what a scope a failure aborted is refused with, once its callback resolved and
+	 * `leave` has waited for what it sent: nothing is added meanwhile, since the context
+	 * is no longer the scope's. None when no failure stands.
 	 */
-	const assertNotAborted = async (tx: OpenTransaction): Promise<void> => {
-		if (!abortsOnFailure) return;
-		while (tx.pending.size > 0) await Promise.all(tx.pending);
-		if (tx.failure === undefined) return;
-		throw new TransactionAbortedError(
-			"a statement inside the transaction failed, and Postgres aborted the " +
-				"transaction with it: it was rolled back, not committed. The callback " +
+	const abortedIn = (scope: Scope): TransactionAbortedError | undefined => {
+		if (!abortsOnFailure || scope.failure === undefined) return undefined;
+		const [what, outcome] =
+			scope.parent === undefined
+				? ["transaction", "it was rolled back, not committed"]
+				: ["savepoint", "the savepoint was rolled back to, not kept"];
+		return new TransactionAbortedError(
+			`a statement inside the ${what} failed, and Postgres aborted the ` +
+				`transaction with it: ${outcome}. The callback ` +
 				"caught that statement's error and returned as if it had succeeded",
 			dialect,
 			{ kind: "aborted" },
-			tx.failure.error,
+			scope.failure.error,
 		);
 	};
 
@@ -319,11 +407,11 @@ export function createSingleConnectionDriver(
 		}
 		const refused = insideSync("query()");
 		if (refused !== undefined) return Promise.reject(refused);
-		const tx = openTransaction();
+		const scope = openScope();
 		const answer =
-			tx === undefined
+			scope === undefined
 				? enqueue(() => runOn(backend, text, values))
-				: inTransaction(tx, () => runOn(tx.connection, text, values));
+				: inScope(scope, () => runOn(scope.connection, text, values));
 		return answer as Promise<QueryResult<T>>;
 	};
 
@@ -335,10 +423,10 @@ export function createSingleConnectionDriver(
 		}
 		const refused = insideSync("exec()");
 		if (refused !== undefined) return Promise.reject(refused);
-		const tx = openTransaction();
-		return tx === undefined
+		const scope = openScope();
+		return scope === undefined
 			? enqueue(() => execOn(backend, script))
-			: inTransaction(tx, () => execOn(tx.connection, script));
+			: inScope(scope, () => execOn(scope.connection, script));
 	};
 
 	const transaction = <T>(
@@ -355,7 +443,7 @@ export function createSingleConnectionDriver(
 		const refused = insideSync("transaction()");
 		if (refused !== undefined) return Promise.reject(refused);
 		// Nested: the open transaction is the transaction, as it was opened.
-		if (openTransaction() !== undefined) return invoke(fn);
+		if (openScope() !== undefined) return invoke(fn);
 		return enqueue(async () => {
 			// Open for the sync tier until the backend is done, not until `fn` is: between
 			// the two the connection is still inside the transaction (S4).
@@ -363,12 +451,7 @@ export function createSingleConnectionDriver(
 			let thrown: Thrown | undefined;
 			try {
 				return await backend.transaction(async (connection) => {
-					const tx: OpenTransaction = {
-						open: true,
-						connection,
-						failure: undefined,
-						pending: new Set(),
-					};
+					const tx = scopeOn(connection, undefined);
 					let result: T;
 					try {
 						result = await current.run(tx, () => invoke(fn));
@@ -378,10 +461,11 @@ export function createSingleConnectionDriver(
 					} finally {
 						// Before the backend commits or rolls back: whatever the callback
 						// left running is a stranger from here on, and queues like one.
-						tx.open = false;
+						await leave(tx);
 					}
 					// Not the callback's error: thrown here, the backend rolls back.
-					await assertNotAborted(tx);
+					const refusal = abortedIn(tx);
+					if (refusal !== undefined) throw refusal;
 					return result;
 				}, readOnly);
 			} catch (error) {
@@ -390,6 +474,77 @@ export function createSingleConnectionDriver(
 				asyncOpen = false;
 			}
 		});
+	};
+
+	/**
+	 * `fn` in a savepoint of `parent`, in a scope of its own. Called in `parent`'s turn:
+	 * nothing else of that scope runs until it has settled.
+	 */
+	const runSavepoint = async <T>(
+		parent: Scope,
+		fn: (tx: Driver) => Promise<T>,
+	): Promise<T> => {
+		const scope = scopeOn(parent.connection, parent);
+		const name = savepointName(++savepoints);
+		/** Why the savepoint was undone: the callback's rejection, or the core's refusal. */
+		let undone: Thrown | undefined;
+		try {
+			return await backend.savepoint(
+				async () => {
+					let result: T;
+					try {
+						result = await current.run(scope, () => invoke(fn));
+					} catch (error) {
+						undone = { error };
+						throw error;
+					} finally {
+						// Before the backend releases it or rolls back to it: whatever the
+						// callback left running is in the enclosing scope from here on.
+						await leave(scope);
+					}
+					// Not the callback's error: thrown here, the backend rolls back to it,
+					// which is what recovers the transaction.
+					const refusal = abortedIn(scope);
+					if (refusal !== undefined) {
+						undone = { error: refusal };
+						throw refusal;
+					}
+					return result;
+				},
+				parent.connection,
+				name,
+			);
+		} catch (error) {
+			// Undone, with the transaction as it was before it: the answer is why.
+			if (undone !== undefined && error === undone.error) throw error;
+			// The savepoint itself was refused: opening it, releasing it, or rolling back
+			// to it. On `pg` that is a failed statement of the enclosing scope.
+			const refusal = wrap(error);
+			if (abortsOnFailure && !(refusal instanceof TypeError)) {
+				parent.failure ??= { error: refusal };
+			}
+			throw refusal;
+		} finally {
+			savepoints--;
+		}
+	};
+
+	const savepoint = <T>(fn: (tx: Driver) => Promise<T>): Promise<T> => {
+		try {
+			assertCallback(fn, "savepoint(fn)");
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		const refused = insideSync("savepoint()");
+		if (refused !== undefined) return Promise.reject(refused);
+		const scope = openScope();
+		// Outside a transaction there is none to save a point in: the unit is one.
+		if (scope === undefined) return transaction(fn);
+		// In the scope's turn: after a savepoint opened there before it, and before
+		// whatever the scope issues next.
+		const answer = onTurn(scope, () => runSavepoint(scope, fn));
+		track(scope, answer);
+		return answer;
 	};
 
 	const holding = new AsyncLocalStorage<Holding>();
@@ -448,14 +603,14 @@ export function createSingleConnectionDriver(
 		// Re-entrant.
 		if (holds(name)) return invoke(fn);
 		// Inside an open transaction the transaction is the lock, on this connection.
-		const tx = openTransaction();
-		if (tx !== undefined) {
+		const scope = openScope();
+		if (scope !== undefined) {
 			if (lock === undefined) return invoke(fn);
 			return hold(name, () =>
 				underLock(
 					fn,
-					() => inTransaction(tx, () => lock(name, true), false),
-					(free) => inTransaction(tx, free, false),
+					() => inScope(scope, () => lock(name, true), false),
+					(free) => inScope(scope, free, false),
 				),
 			);
 		}
@@ -483,7 +638,7 @@ export function createSingleConnectionDriver(
 		if (closing !== undefined) return closing;
 		const refused = insideSync("close()");
 		if (refused !== undefined) return Promise.reject(refused);
-		if (openTransaction() !== undefined) {
+		if (openScope() !== undefined) {
 			// It would queue behind the transaction, which waits for it.
 			return Promise.reject(
 				new TypeError("close() cannot be called inside a transaction"),
@@ -498,21 +653,37 @@ export function createSingleConnectionDriver(
 	 * transaction it is that transaction (S2); inside an open async transaction's own
 	 * context it joins that one (S3); with no transaction open it runs at once, ahead of
 	 * whatever is queued (S6). Anywhere else an async transaction is open, and the call
-	 * is refused (S4).
+	 * is refused (S4). So is one from an async scope where a savepoint runs or anything
+	 * waits its turn: a sync call cannot wait, and would land inside that savepoint.
 	 */
 	const assertSyncTurn = (call: string): void => {
-		if (syncDepth > 0 || !asyncOpen || openTransaction() !== undefined) return;
+		if (syncDepth > 0) return;
+		const scope = openScope();
+		if (scope === undefined) {
+			if (!asyncOpen) return;
+			throw new TypeError(
+				`sync.${call} cannot run while an async transaction is open, from outside ` +
+					"its callback: it could only run inside a transaction it does not " +
+					"belong to. Await the transaction first, or issue the call from inside " +
+					"its callback",
+			);
+		}
+		if (scope.waiting === 0) return;
 		throw new TypeError(
-			`sync.${call} cannot run while an async transaction is open, from outside its ` +
-				"callback: it could only run inside a transaction it does not belong to. " +
-				"Await the transaction first, or issue the call from inside its callback",
+			`sync.${call} cannot run while a savepoint opened in this transaction is ` +
+				"running, from outside its callback: it could only run inside that " +
+				"savepoint. Await the savepoint first, or issue the call from inside its " +
+				"callback",
 		);
 	};
 
 	/** The sync tier over `engine`: the same connection, answering at once. */
 	const syncTier = (engine: SyncBackend): SyncDriver => {
-		/** A sync transaction's callback, counted while it runs; a thenable it answers is S1. */
-		const run = <T>(fn: (tx: SyncDriver) => T): T => {
+		/**
+		 * A sync transaction's or savepoint's callback, counted while it runs; a thenable
+		 * it answers is S1. `call` names the one refused.
+		 */
+		const run = <T>(fn: (tx: SyncDriver) => T, call = "transaction"): T => {
 			syncDepth++;
 			let result: T;
 			try {
@@ -521,13 +692,13 @@ export function createSingleConnectionDriver(
 				syncDepth--;
 			}
 			if (isThenable(result)) {
-				// Its outcome went with the rolled-back transaction; the TypeError says why.
+				// Its outcome went with what was rolled back; the TypeError says why.
 				if (result instanceof Promise)
 					Promise.prototype.then.call(result, settled, settled);
 				throw new TypeError(
-					"sync.transaction(fn): fn returned a promise, so the transaction was " +
-						"rolled back. A sync transaction's callback cannot be async: it returns " +
-						"at its first await. Use transaction() for one that awaits",
+					`sync.${call}(fn): fn returned a promise, so the ${call} was ` +
+						`rolled back. A sync ${call}'s callback cannot be async: it returns ` +
+						`at its first await. Use ${call}() for one that awaits`,
 				);
 			}
 			return result;
@@ -560,7 +731,7 @@ export function createSingleConnectionDriver(
 				assertSyncTurn("transaction()");
 				// Nested (S2), or inside an async transaction's own context (S3): the open
 				// transaction is the transaction, as it was opened.
-				if (syncDepth > 0 || openTransaction() !== undefined) return run(fn);
+				if (syncDepth > 0 || openScope() !== undefined) return run(fn);
 				let thrown: Thrown | undefined;
 				try {
 					return engine.transaction(() => {
@@ -573,6 +744,31 @@ export function createSingleConnectionDriver(
 					}, readOnly);
 				} catch (error) {
 					throw fromTransaction(error, thrown);
+				}
+			},
+			savepoint<T>(fn: (tx: SyncDriver) => T): T {
+				assertCallback(fn, "sync.savepoint(fn)");
+				assertSyncTurn("savepoint()");
+				// Outside a transaction there is none to save a point in: the unit is one.
+				if (syncDepth === 0 && openScope() === undefined)
+					return tier.transaction(fn);
+				// Inside a sync transaction, or inside an async one's own context (S3): a
+				// savepoint of it.
+				const name = savepointName(++savepoints);
+				let thrown: Thrown | undefined;
+				try {
+					return engine.savepoint(() => {
+						try {
+							return run(fn, "savepoint");
+						} catch (error) {
+							thrown = { error };
+							throw error;
+						}
+					}, name);
+				} catch (error) {
+					throw fromTransaction(error, thrown);
+				} finally {
+					savepoints--;
 				}
 			},
 		};
@@ -588,6 +784,7 @@ export function createSingleConnectionDriver(
 		query,
 		exec,
 		transaction,
+		savepoint,
 		exclusive,
 		close,
 		...(sync === undefined ? {} : { sync }),

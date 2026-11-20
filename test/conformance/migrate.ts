@@ -2,12 +2,12 @@
 // on every registered adapter. `up()` applies versions in order and records each, a second
 // `up()` does nothing, `down()` and `uninstall()` reverse, a read creates no table, a bad
 // table name is a `TypeError`, a worker's statements roll back with its step, and a failing
-// step leaves what the adapter's lock mode says:
+// step is undone alone, whichever way the adapter runs a step:
 //
-// - `capabilities.crossProcessLock` (a Postgres pool or client): the run commits step by
-//   step, so the steps before the failed one stay, and the failed one is undone.
-// - otherwise: the run is one transaction, so the failed step undoes the whole run, the
-//   version table's creation included.
+// - `capabilities.crossProcessLock` (a Postgres pool or client): each step is a transaction
+//   of its own under the run's lock.
+// - otherwise: the run is one transaction and each step a savepoint of it (backlog T26),
+//   committed with what the steps before the failed one did.
 //
 // Runner-agnostic: no `node:test` here, so the same cases run inside workerd. Every case
 // creates and disposes a database of its own. The SQL is portable between the dialects or
@@ -16,7 +16,7 @@
 
 import assert from "node:assert/strict";
 import { createMigrate, MIGRATE_TABLE } from "../../src/migrate/mod.ts";
-import { type Driver, sql } from "../../src/mod.ts";
+import { type Driver, SqlError, sql } from "../../src/mod.ts";
 import type { AdapterCase, Suite } from "./_suite.ts";
 
 /** A promise and the function that resolves it: a gate a case opens by hand. */
@@ -125,7 +125,7 @@ export function migrateContract(suite: Suite, adapter: AdapterCase): void {
 		assert.deepEqual(await recorded(db), ["1.0.0", "1.1.0"]);
 	});
 
-	test("migrate: a failing step leaves what the adapter's lock mode says", async (db) => {
+	test("migrate: a failing step is undone alone, and the steps before it stay", async (db) => {
 		const migrate = createMigrate(db);
 		migrate.addVersion("1.0.0", async ({ db }) => {
 			await db.exec("create table a (id integer)");
@@ -138,23 +138,17 @@ export function migrateContract(suite: Suite, adapter: AdapterCase): void {
 		});
 		await assert.rejects(migrate.up(), boom);
 
-		// The failed step is undone on every adapter.
+		// The failed step is undone, with its version mark.
 		assert.equal(await tableExists(db, "b"), false);
 		assert.ok(!(await logged(db)).includes("2.0.0"));
 
-		if (db.capabilities.crossProcessLock) {
-			// Committed step by step: the step before the failed one stays.
-			assert.equal(await migrate.getActiveVersion(), "1.0.0");
-			assert.equal(await tableExists(db, "a"), true);
-			assert.deepEqual(await logged(db), ["1.0.0"]);
-			assert.deepEqual(await recorded(db), ["1.0.0"]);
-		} else {
-			// One transaction: the whole run is undone, the version table included.
-			assert.equal(await migrate.getActiveVersion(), undefined);
-			assert.equal(await tableExists(db, "a"), false);
-			assert.deepEqual(await logged(db), []);
-			assert.equal(await tableExists(db, MIGRATE_TABLE), false);
-		}
+		// The step before it stays: committed on its own under a cross-process lock, and
+		// with the run's one transaction, to which the failed step was a savepoint,
+		// everywhere else.
+		assert.equal(await migrate.getActiveVersion(), "1.0.0");
+		assert.equal(await tableExists(db, "a"), true);
+		assert.deepEqual(await logged(db), ["1.0.0"]);
+		assert.deepEqual(await recorded(db), ["1.0.0"]);
 
 		// Fixed, the next run takes it from where the failure left it.
 		const fixed = createMigrate(db);
@@ -166,7 +160,7 @@ export function migrateContract(suite: Suite, adapter: AdapterCase): void {
 			await db.exec("create table b (id integer)");
 			await log(db, "2.0.0");
 		});
-		assert.equal(await fixed.up(), db.capabilities.crossProcessLock ? 1 : 2);
+		assert.equal(await fixed.up(), 1);
 		assert.deepEqual(await logged(db), ["1.0.0", "2.0.0"]);
 		assert.equal(await fixed.getActiveVersion(), "2.0.0");
 	});
@@ -187,6 +181,36 @@ export function migrateContract(suite: Suite, adapter: AdapterCase): void {
 		assert.deepEqual(await logged(db), []);
 		assert.equal(await tableExists(db, "c"), false);
 		assert.equal(await migrate.getActiveVersion(), undefined);
+		// The run itself was kept: the version table it made is there, and empty.
+		assert.deepEqual(await recorded(db), []);
+	});
+
+	test("migrate: a step the database refused is undone alone too, and the run goes on later", async (db) => {
+		// A failed statement, not a thrown error: on Postgres it aborts the transaction
+		// the step is in, which only the step's own rollback lifts.
+		const migrate = createMigrate(db);
+		migrate.addVersion("1.0.0", ({ db }) => log(db, "1.0.0"));
+		migrate.addVersion("2.0.0", async ({ db }) => {
+			await log(db, "2.0.0");
+			await db.query("insert into no_such_table values (1)");
+		});
+		migrate.addVersion("3.0.0", ({ db }) => log(db, "3.0.0"));
+		await assert.rejects(
+			migrate.up(),
+			(error) => error instanceof Error && error.cause instanceof SqlError,
+		);
+		assert.deepEqual(await logged(db), ["1.0.0"]);
+		assert.deepEqual(await recorded(db), ["1.0.0"]);
+		assert.equal(await migrate.getActiveVersion(), "1.0.0");
+
+		// The connection is in no transaction, and no lock is left held.
+		const fixed = createMigrate(db);
+		fixed.addVersion("1.0.0", ({ db }) => log(db, "1.0.0"));
+		fixed.addVersion("2.0.0", ({ db }) => log(db, "2.0.0 fixed"));
+		fixed.addVersion("3.0.0", ({ db }) => log(db, "3.0.0"));
+		assert.equal(await fixed.up(), 2);
+		assert.deepEqual(await logged(db), ["1.0.0", "2.0.0 fixed", "3.0.0"]);
+		assert.deepEqual(await recorded(db), ["1.0.0", "2.0.0", "3.0.0"]);
 	});
 
 	test("migrate: down() and uninstall() reverse", async (db) => {

@@ -14,12 +14,14 @@ of the single-connection driver core. A pool of many connections is not: follow
 2. Declare the client's shape structurally (`<Name>Like`): only the members the adapter
    calls. Import nothing from the driver library, not even its types.
 3. Implement `SingleConnectionBackend` (`src/single/backend.ts`): `run`, `exec`,
-   `transaction(fn, readOnly)`, `classify` (the dialect's classifier), `close`, and
-   `lock(name, inTransaction)` only where the database has a lock other processes honour.
-   Throw the driver's errors as they are: the core wraps them. Throw a `TypeError` for a
-   refusal of the backend's own.
-4. Where the engine is synchronous, implement `SyncBackend` too; the core builds
-   `driver.sync` over it.
+   `transaction(fn, readOnly)`, `savepoint(fn, inner, name)`, `classify` (the dialect's
+   classifier), `close`, and `lock(name, inTransaction)` only where the database has a
+   lock other processes honour. Throw the driver's errors as they are: the core wraps
+   them. Throw a `TypeError` for a refusal of the backend's own. A database that takes
+   `SAVEPOINT` gets its `savepoint` from `savepointBy` (`src/core/savepoint.ts`); one that
+   does not nests its library's own transaction.
+4. Where the engine is synchronous, implement `SyncBackend` too (its `savepoint` from
+   `savepointBySync`); the core builds `driver.sync` over it.
 5. Export `create<Name>Driver(client)`, which refuses a value of the wrong shape with a
    `TypeError` and returns `createSingleConnectionDriver(backend, sync?)`.
 6. `package.json`: add `"./<name>"` to `exports` (`types` and `import` under `dist/`); add
@@ -48,6 +50,7 @@ of the single-connection driver core. A pool of many connections is not: follow
 
 import { classifySqlite } from "../core/classify-sqlite.ts";
 import type { Driver, QueryResult, Row } from "../core/contract.ts";
+import { savepointBy } from "../core/savepoint.ts";
 import type { Connection, SingleConnectionBackend } from "../single/backend.ts";
 import { createSingleConnectionDriver } from "../single/driver.ts";
 
@@ -92,6 +95,9 @@ export function createExampleDriver(client: ExampleLike): Driver {
 				throw error;
 			}
 		},
+		savepoint<T>(fn: () => Promise<T>, _inner: Connection, name: string) {
+			return savepointBy(exec, name, fn);
+		},
 		classify: classifySqlite,
 		close: () => client.close(),
 	};
@@ -104,6 +110,7 @@ export function createExampleDriver(client: ExampleLike): Driver {
 - [ ] Every conformance body passes on it: `pnpm run test:<name>`, then `pnpm run ci`.
 - [ ] `query` refuses a text of several statements before any of it runs (R11).
 - [ ] A read-only transaction refuses a write with a `ReadOnlyError` (R7).
+- [ ] A savepoint is undone alone, and the transaction goes on (R12).
 - [ ] Rows are plain objects; bytes read back as a `Uint8Array` (R10).
 - [ ] `capabilities` is what the core derives: `sync` from a `SyncBackend`,
       `crossProcessLock` from `lock`.

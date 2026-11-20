@@ -2,11 +2,11 @@
 //
 // Assumptions A1–A6 are what the design rests on: each is asserted, and a failure means the
 // single-connection core is wrong for Durable Objects, not that the test needs adjusting.
-// Probes P1–P8 are questions: each answer is printed as a diagnostic and pinned, so a
+// Probes P1–P10 are questions: each answer is printed as a diagnostic and pinned, so a
 // workerd upgrade that changes one fails here first. Every answer is written up, with the
 // workerd version it was observed on, in the archived plan set's DO-FINDINGS.md,
 // `docs/_archive/plans/v0-foundation/DO-FINDINGS.md` (F01–F06 for the assumptions,
-// F07–F14 for the probes); change the two together.
+// F07–F16 for the probes); change the two together.
 //
 // This file is adapter-specific by nature: it asks the runtime, not an adapter, so it has
 // no conformance body.
@@ -410,5 +410,17 @@ describe("do/probe: probes", () => {
 			refusals.async ?? "",
 			/^p9-violate: HTTP 500, not JSON: Error: internal error; reference = \w+/,
 		);
+	});
+
+	test("P10 (F16): transactionSync nests inside an open async transaction; an inner throw undoes only the inner part", async (t) => {
+		const answer = await call("p10");
+		record(t, answer);
+		assert.deepEqual(answer, {
+			outcome: "inner value",
+			innerError: "inner boom",
+			afterCommit: ["outer 1", "inner kept", "outer 2"],
+			rolledBack: "outer boom",
+			afterRollback: [],
+		});
 	});
 });

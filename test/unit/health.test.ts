@@ -68,6 +68,7 @@ function stubDriver(dialect: DialectName = "pg"): Stub {
 			}),
 			exec: unused,
 			transaction: unused,
+			savepoint: unused,
 			exclusive: unused,
 			close: unused,
 		},

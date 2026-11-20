@@ -33,6 +33,12 @@
  *   runs, with a `TypeError` where the adapter sees it, or the database's own refusal
  *   where the database does. Blanks, semicolons and comments after it are not a
  *   statement. A script goes through `exec`.
+ * - **R12** `savepoint` runs `fn` as a unit of the open transaction: kept when `fn`
+ *   resolves, undone alone when it rejects, and the transaction goes on either way.
+ *   Savepoints nest, and two opened at once run one after the other. A statement issued
+ *   in the transaction from outside the savepoint's callback waits for the savepoint to
+ *   end. On `pg` a callback that swallowed a failure gets a rejection, and the savepoint
+ *   is undone. Outside a transaction a savepoint is a transaction.
  *
  * Runtime-neutral: imports only the fragment builder.
  */
@@ -149,6 +155,32 @@ export interface Driver {
 	 * rejection; the lock is released either way.
 	 */
 	exclusive<T>(name: string, fn: (tx: Driver) => Promise<T>): Promise<T>;
+	/**
+	 * Run `fn` as a unit that is kept or undone as a whole, without ending the transaction
+	 * it is in: what a step that may fail needs, when the work before it is to stay.
+	 *
+	 * - **Inside an open transaction** it is a savepoint of that transaction: released
+	 *   when `fn` resolves, rolled back to when it rejects, with `fn`'s rejection. The
+	 *   transaction goes on either way. On Postgres too, where a failed statement aborts
+	 *   the transaction: rolling back to the savepoint is what lifts that.
+	 * - **Outside one** there is no transaction to save a point in, so the unit is a
+	 *   transaction of its own: `transaction(fn)`. Code that is handed a driver, and does
+	 *   not know whether its caller opened a transaction, gets one unit either way.
+	 * - **Savepoints nest**: one inside another is undone alone, and goes with the outer
+	 *   one when that is undone. They do not overlap: a second one opened in the same
+	 *   transaction while the first is running waits for it, and so does any statement
+	 *   issued there from outside the first one's callback, so that it neither runs
+	 *   inside that savepoint nor goes with its rollback.
+	 * - **A failure the callback swallowed** (Postgres): `fn` caught a failed statement's
+	 *   error and resolved. The savepoint cannot be kept, so it is rolled back to, and
+	 *   the call rejects with `TransactionAbortedError`; the transaction goes on. SQLite
+	 *   undoes the failed statement alone and keeps the rest, as in a transaction.
+	 *
+	 * `fn` receives this driver, as `transaction`'s callback does. A promise that outlives
+	 * its savepoint runs whatever it issues afterwards in the transaction, outside the
+	 * savepoint.
+	 */
+	savepoint<T>(fn: (tx: Driver) => Promise<T>): Promise<T>;
 	/** End the client the adapter was given. Idempotent. */
 	close(): Promise<void>;
 	/** The synchronous tier, on an adapter whose engine is synchronous underneath. */
@@ -164,14 +196,17 @@ export interface Driver {
  * as the async one, so the two refuse each other where a call would land in the wrong
  * transaction:
  *
- * - **S1** A transaction callback that returns a thenable rolls back, with a `TypeError`.
+ * - **S1** A transaction or savepoint callback that returns a thenable is undone, with a
+ *   `TypeError`.
  * - **S2** A nested `transaction` joins the open one, as it was opened.
  * - **S3** A sync call from inside an open async transaction's own callback runs inside
- *   that transaction.
+ *   that transaction; a sync `savepoint` there is a savepoint of it.
  * - **S4** A sync call while an async transaction is open, from anywhere else, is a
- *   `TypeError`.
- * - **S5** An async call from inside a sync transaction's callback rejects with a
- *   `TypeError`: it could only run after the callback returned.
+ *   `TypeError`. So is one from inside that transaction while a savepoint opened there
+ *   is still running, from outside the savepoint's callback: it could only run inside
+ *   that savepoint.
+ * - **S5** An async call from inside a sync transaction's or savepoint's callback rejects
+ *   with a `TypeError`: it could only run after the callback returned.
  * - **S6** With no transaction open, a sync call runs at once, ahead of queued async work.
  */
 export interface SyncDriver {
@@ -182,6 +217,12 @@ export interface SyncDriver {
 	query<T = Row>(text: string, params?: readonly unknown[]): QueryResult<T>;
 	exec(script: string): void;
 	transaction<T>(fn: (tx: SyncDriver) => T, options?: TransactionOptions): T;
+	/**
+	 * `Driver.savepoint`, synchronously: a savepoint of the open transaction, kept when
+	 * `fn` returns and undone alone when it throws, with what it threw; a transaction of
+	 * its own when none is open.
+	 */
+	savepoint<T>(fn: (tx: SyncDriver) => T): T;
 }
 
 /**

@@ -1,5 +1,5 @@
 // The Durable Object of the Durable Objects spike (plan doc 02 #1). One handler per
-// assumption (A1–A6) and per probe (P1–P8); each observes and returns what it saw, and
+// assumption (A1–A6) and per probe (P1–P10); each observes and returns what it saw, and
 // `test/do/probe.test.ts` asserts on it in Node. A handler that throws is reported as an
 // error envelope, so an unexpected throw fails the test that called it, never the worker.
 //
@@ -661,6 +661,55 @@ const handlers: Record<string, Handler> = {
 				"select (select count(*) from child) as children, (select count(*) from parent) as parents",
 			)
 			.one();
+	},
+
+	// P10 (added at T26): does `transactionSync` nest inside an open async `transaction`,
+	// and what does an inner throw undo? P1 and P2 nest each form inside itself; a sync
+	// savepoint inside an async transaction's callback is the two mixed.
+	async p10({ storage }) {
+		const { sql } = storage;
+		sql.exec("create table t (v)");
+		let innerError: string | undefined;
+		const outcome = await storage.transaction(async () => {
+			sql.exec("insert into t values ('outer 1')");
+			await sleep(5);
+			const kept = storage.transactionSync(() => {
+				sql.exec("insert into t values ('inner kept')");
+				return "inner value";
+			});
+			try {
+				storage.transactionSync(() => {
+					sql.exec("insert into t values ('inner undone')");
+					throw new Error("inner boom");
+				});
+			} catch (error) {
+				innerError = (error as Error).message;
+			}
+			sql.exec("insert into t values ('outer 2')");
+			return kept;
+		});
+		const afterCommit = values(sql);
+		sql.exec("delete from t");
+
+		// An inner one that was kept goes with the outer one's rollback.
+		const rolledBack = await storage
+			.transaction(async () => {
+				storage.transactionSync(() => {
+					sql.exec("insert into t values ('inner')");
+				});
+				throw new Error("outer boom");
+			})
+			.then(
+				() => "resolved",
+				(error: unknown) => (error as Error).message,
+			);
+		return {
+			outcome,
+			innerError,
+			afterCommit,
+			rolledBack,
+			afterRollback: values(sql),
+		};
 	},
 };
 

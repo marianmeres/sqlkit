@@ -3,7 +3,8 @@
 What a SQLite-backed Durable Object does with the calls the design relies on, observed in
 real workerd. Source: [02](./02-adapters.md) #1. One entry per assumption (F01–F06 for
 A1–A6) and per probe (F07–F14 for P1–P8). F15 (P9) was added at T19, by the adapter row,
-on the same workerd; so were the notes marked "T19" under F10.
+on the same workerd; so were the notes marked "T19" under F10. F16 (P10) was added with
+savepoints (backlog T26), on the same workerd, on 2026-11-20.
 
 **Observed on** workerd `1.20260730.1`, through Miniflare `4.20260730.0`, compatibility date
 `2026-07-01`, compatibility flags `nodejs_compat` only, Node 26.13.1, macOS arm64, on
@@ -289,3 +290,18 @@ Consequence: the `errors` body's two cases of a constraint that `COMMIT` checks 
 here: there is no rejection to type, and the failing request takes its object down with
 it. They are listed under the `do` adapter's `except` with this entry as the reason. The
 adapter's docs tell a host to keep foreign keys immediate on Durable Objects.
+
+### F16 — P10: does `transactionSync` nest inside an open async `transaction()`? (added at T26)
+
+**Yes, as a savepoint**, as each form does inside itself (F07, F08). Inside an async
+`transaction()` closure, after it had awaited a timer, a `transactionSync` that returned
+left its write in the outer transaction, and one that threw undid only its own write: the
+outer closure caught the error, wrote again and resolved, and its writes before and after
+committed with the inner one that was kept. An inner `transactionSync` that returned
+inside an outer `transaction()` that then rejected was rolled back with it.
+
+Consequence: `savepoint` on this adapter is the storage's own nested transaction on both
+tiers, `storage.transaction` on the async one and `storage.transactionSync` on the sync
+one, and a sync savepoint inside an async transaction's callback (S3) holds. No
+`SAVEPOINT` statement is sent, which F04 refuses. The `driver` and `sync` bodies' savepoint
+cases run on the adapter with no exception.

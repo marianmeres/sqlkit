@@ -3,8 +3,8 @@
 A thin, convention-driven SQL toolkit for PostgreSQL and SQLite (node:sqlite, node-postgres,
 PGlite, Durable Objects): `sql` fragments that keep text and values apart, one driver
 contract (async, plus a sync tier where the engine is synchronous), typed errors,
-transactions, statement builders, row decoders, retry, health checks and migrations. Not
-an ORM, not a query builder. An app commits to one dialect.
+transactions and savepoints, statement builders, row decoders, retry, health checks and
+migrations. Not an ORM, not a query builder. An app commits to one dialect.
 
 ## Quick Reference
 
@@ -23,21 +23,21 @@ an ORM, not a query builder. An app commits to one dialect.
 
 ## Project Structure
 
-| Path                                       | Export            | Holds                                                                               |
-| ------------------------------------------ | ----------------- | ----------------------------------------------------------------------------------- |
-| `src/mod.ts`                               | `.`               | the core, runtime-neutral (re-exports `src/core/`)                                  |
-| `src/core/`                                |                   | fragments, contract, params, errors, classifiers, builders, decoders, retry, health |
-| `src/single/`                              |                   | the single-connection driver core and its backend seam                              |
-| `src/sqlite/mod.ts`                        | `./sqlite`        | node:sqlite (with the sync tier)                                                    |
-| `src/pg/mod.ts`                            | `./pg`            | node-postgres: a pool, or one client                                                |
-| `src/pglite/mod.ts`                        | `./pglite`        | PGlite                                                                              |
-| `src/do/mod.ts`                            | `./do`            | Durable Objects SQLite storage (with the sync tier; needs `nodejs_compat`)          |
-| `src/migrate/mod.ts`                       | `./migrate`       | `@marianmeres/migrate` wired over a `Driver`                                        |
-| `src/migrate/files.ts`                     | `./migrate/files` | SQL files as versions (Node only)                                                   |
-| `test/conformance/`                        |                   | bodies every adapter runs, their binders, the registry                              |
-| `test/unit/`                               |                   | no database: pure functions, stub backends, guards                                  |
-| `test/pg/`, `test/pglite/`, `test/sqlite/` |                   | one adapter's own suites and fixture                                                |
-| `test/do/`                                 |                   | workerd harness, the probe, every body run in workerd, the `do` adapter's own suite |
+| Path                                       | Export            | Holds                                                                                                     |
+| ------------------------------------------ | ----------------- | --------------------------------------------------------------------------------------------------------- |
+| `src/mod.ts`                               | `.`               | the core, runtime-neutral (re-exports `src/core/`)                                                        |
+| `src/core/`                                |                   | fragments, contract, params, errors, classifiers, savepoint statements, builders, decoders, retry, health |
+| `src/single/`                              |                   | the single-connection driver core and its backend seam                                                    |
+| `src/sqlite/mod.ts`                        | `./sqlite`        | node:sqlite (with the sync tier)                                                                          |
+| `src/pg/mod.ts`                            | `./pg`            | node-postgres: a pool, or one client                                                                      |
+| `src/pglite/mod.ts`                        | `./pglite`        | PGlite                                                                                                    |
+| `src/do/mod.ts`                            | `./do`            | Durable Objects SQLite storage (with the sync tier; needs `nodejs_compat`)                                |
+| `src/migrate/mod.ts`                       | `./migrate`       | `@marianmeres/migrate` wired over a `Driver`                                                              |
+| `src/migrate/files.ts`                     | `./migrate/files` | SQL files as versions (Node only)                                                                         |
+| `test/conformance/`                        |                   | bodies every adapter runs, their binders, the registry                                                    |
+| `test/unit/`                               |                   | no database: pure functions, stub backends, guards                                                        |
+| `test/pg/`, `test/pglite/`, `test/sqlite/` |                   | one adapter's own suites and fixture                                                                      |
+| `test/do/`                                 |                   | workerd harness, the probe, every body run in workerd, the `do` adapter's own suite                       |
 
 ## Critical Conventions
 
@@ -62,7 +62,7 @@ an ORM, not a query builder. An app commits to one dialect.
 ## Before Making Changes
 
 - [ ] Read the section of `docs/architecture.md` for the layer you touch.
-- [ ] Find the rule in the conformance body: R1–R11 in `test/conformance/driver.ts`,
+- [ ] Find the rule in the conformance body: R1–R12 in `test/conformance/driver.ts`,
       S1–S6 in `test/conformance/sync.ts`; the contract states them in
       `src/core/contract.ts`.
 - [ ] Follow `docs/conventions.md`; for a recurring change, `docs/tasks.md`.

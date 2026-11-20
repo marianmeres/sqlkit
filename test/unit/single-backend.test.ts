@@ -8,6 +8,10 @@
 // The sync tier's routing is pinned here too (plan doc 02 #3), along with the one moment
 // of S4 no adapter can be timed into: after the async callback settled, before the
 // backend committed.
+//
+// And the savepoint (backlog T26): when the backend is asked for one, under which name, in
+// which order with what the enclosing scope issued, and what the core does when the
+// savepoint's own statements are refused, which no real database can be made to do.
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -72,6 +76,18 @@ function stub(options: { lock?: boolean; failRelease?: boolean } = {}): Stub {
 				log.push("rollback");
 				throw error;
 			}
+		},
+		async savepoint(fn, inner, name) {
+			await inner.exec(`savepoint ${name}`);
+			let result: Awaited<ReturnType<typeof fn>>;
+			try {
+				result = await fn();
+			} catch (error) {
+				await inner.exec(`rollback to ${name}`);
+				throw error;
+			}
+			await inner.exec(`release ${name}`);
+			return result;
 		},
 		classify: () => ({ kind: "unknown" }),
 		async close() {
@@ -277,6 +293,17 @@ function syncStub(log: string[]): SyncBackend {
 				throw error;
 			}
 		},
+		savepoint(fn, name) {
+			log.push(`sync savepoint ${name}`);
+			try {
+				const result = fn();
+				log.push(`sync release ${name}`);
+				return result;
+			} catch (error) {
+				log.push(`sync rollback to ${name}`);
+				throw error;
+			}
+		},
 	};
 }
 
@@ -412,6 +439,18 @@ function failing(failAt: string): SingleConnectionBackend & { sync: SyncBackend 
 			fail("commit");
 			return result;
 		},
+		async savepoint(fn) {
+			fail("savepoint");
+			let result: Awaited<ReturnType<typeof fn>>;
+			try {
+				result = await fn();
+			} catch (error) {
+				fail("undo");
+				throw error;
+			}
+			fail("keep");
+			return result;
+		},
 		async lock() {
 			fail("lock");
 			return async () => {
@@ -434,6 +473,18 @@ function failing(failAt: string): SingleConnectionBackend & { sync: SyncBackend 
 				fail("sync begin");
 				const result = fn();
 				fail("sync commit");
+				return result;
+			},
+			savepoint(fn) {
+				fail("sync savepoint");
+				let result: ReturnType<typeof fn>;
+				try {
+					result = fn();
+				} catch (error) {
+					fail("sync undo");
+					throw error;
+				}
+				fail("sync keep");
 				return result;
 			},
 		},
@@ -491,6 +542,25 @@ describe("unit/single-backend: typed errors", () => {
 				(db) => db.transaction((tx) => tx.exclusive("job", async () => "done")),
 			],
 			["release", (db) => db.exclusive("job", async () => "done")],
+			[
+				"savepoint",
+				(db) =>
+					db.transaction((tx) =>
+						tx.savepoint(async () => assert.fail("the callback ran")),
+					),
+			],
+			["keep", (db) => db.transaction((tx) => tx.savepoint(async () => "done"))],
+			[
+				// The rollback's refusal, not the callback's own error: the unit is still
+				// in the transaction, and the caller has to learn that.
+				"undo",
+				(db) =>
+					db.transaction((tx) =>
+						tx.savepoint(async () => {
+							throw new Error("the callback's own");
+						}),
+					),
+			],
 			["close", (db) => db.close()],
 		];
 		for (const [where, call] of cases) {
@@ -517,6 +587,23 @@ describe("unit/single-backend: typed errors", () => {
 				(sync) => sync.transaction(() => assert.fail("the callback ran")),
 			],
 			["sync commit", (sync) => sync.transaction(() => "done")],
+			[
+				"sync savepoint",
+				(sync) =>
+					sync.transaction((tx) =>
+						tx.savepoint(() => assert.fail("the callback ran")),
+					),
+			],
+			["sync keep", (sync) => sync.transaction((tx) => tx.savepoint(() => "done"))],
+			[
+				"sync undo",
+				(sync) =>
+					sync.transaction((tx) =>
+						tx.savepoint(() => {
+							throw new Error("the callback's own");
+						}),
+					),
+			],
 		];
 		for (const [where, call] of cases) {
 			const backend = failing(where);
@@ -581,8 +668,15 @@ describe("unit/single-backend: typed errors", () => {
  * release fail as their text or name says: `fail…` with a driver's error, `refuse…` with
  * a `TypeError` of the backend's own.
  */
-function aborting(dialect: DialectName): Stub {
+function aborting(
+	dialect: DialectName,
+	steps: { open?: string; release?: string; undo?: string; only?: string } = {},
+): Stub {
 	const log: string[] = [];
+	/** What a savepoint's own statement does: as `steps` says, for the savepoint it names. */
+	const step = (name: string, what: string | undefined): void => {
+		if (steps.only === undefined || steps.only === name) outcome(what ?? "");
+	};
 	const outcome = (what: string): void => {
 		if (what.startsWith("fail")) throw driverError(what);
 		if (what.startsWith("refuse")) throw new TypeError(`refused ${what}`);
@@ -606,6 +700,21 @@ function aborting(dialect: DialectName): Stub {
 				log.push("rollback");
 				throw error;
 			}
+		},
+		async savepoint(fn, _inner, name) {
+			// The savepoint's own statements fail as the options say.
+			step(name, steps.open);
+			let result: Awaited<ReturnType<typeof fn>>;
+			try {
+				result = await fn();
+			} catch (error) {
+				step(name, steps.undo);
+				log.push(`rollback to ${name}`);
+				throw error;
+			}
+			step(name, steps.release);
+			log.push(`release ${name}`);
+			return result;
 		},
 		async lock(name) {
 			outcome(name);
@@ -723,5 +832,358 @@ describe("unit/single-backend: an aborted transaction", () => {
 			"committed",
 		);
 		assert.deepEqual(log, ["commit"]);
+	});
+});
+
+describe("unit/single-backend: savepoints", () => {
+	test("the backend is asked for one inside a transaction only, on its connection, named by depth", async () => {
+		const { backend, log } = stub();
+		const db = createSingleConnectionDriver(backend);
+		const boom = new Error("boom");
+		// Outside a transaction it is a transaction: no savepoint is asked for.
+		await db.savepoint((tx) => tx.query("top"));
+		await db.transaction(async (tx) => {
+			await tx.savepoint(async (sp) => {
+				await sp.query("first");
+				const inner = sp.savepoint(async (nested) => {
+					await nested.query("second");
+					throw boom;
+				});
+				assert.equal(await rejection("the inner savepoint", inner), boom);
+			});
+			await tx.savepoint((sp) => sp.query("sibling"));
+		});
+		assert.deepEqual(log, [
+			"begin",
+			"tx: top",
+			"commit",
+			"begin",
+			"tx exec: savepoint sqlkit_1",
+			"tx: first",
+			"tx exec: savepoint sqlkit_2",
+			"tx: second",
+			"tx exec: rollback to sqlkit_2",
+			"tx exec: release sqlkit_1",
+			"tx exec: savepoint sqlkit_1",
+			"tx: sibling",
+			"tx exec: release sqlkit_1",
+			"commit",
+		]);
+	});
+
+	test("what the enclosing scope issues while one runs is sent after it, in the order issued", async () => {
+		const { backend, log } = stub({ lock: true });
+		const db = createSingleConnectionDriver(backend);
+		const inside = gate();
+		const proceed = gate();
+		await db.transaction(async (tx) => {
+			const first = tx.savepoint(async (sp) => {
+				await sp.query("inside 1");
+				inside.open();
+				await proceed.opened;
+				await sp.query("inside 2");
+			});
+			await inside.opened;
+			const waiting = [
+				tx.query("outside 1"),
+				tx.exec("outside 2"),
+				tx.savepoint((sp) => sp.query("second savepoint")),
+				tx.exclusive("job", async () => undefined),
+				tx.query("outside 3"),
+			];
+			proceed.open();
+			await Promise.all([first, ...waiting]);
+			// Nothing waits any more: this one is sent at once.
+			await tx.query("after");
+		});
+		assert.deepEqual(log, [
+			"begin",
+			"tx exec: savepoint sqlkit_1",
+			"tx: inside 1",
+			"tx: inside 2",
+			"tx exec: release sqlkit_1",
+			"tx: outside 1",
+			"tx exec: outside 2",
+			"tx exec: savepoint sqlkit_1",
+			"tx: second savepoint",
+			"tx exec: release sqlkit_1",
+			// The lock is taken in its turn; its release is issued once its callback is
+			// done, so behind what was already waiting by then.
+			"lock job in transaction",
+			"tx: outside 3",
+			"unlock job",
+			"tx: after",
+			"commit",
+		]);
+	});
+
+	test("a scope ends only after the savepoints it did not await, whether it is kept or not", async () => {
+		const { backend, log } = stub();
+		const db = createSingleConnectionDriver(backend);
+		const failed = new Error("the transaction failed");
+		const unawaited: Promise<unknown>[] = [];
+		await db.transaction(async (tx) => {
+			unawaited.push(
+				tx.savepoint(async (sp) => {
+					await sleep(5);
+					await sp.query("late 1");
+				}),
+			);
+		});
+		assert.equal(
+			await rejection(
+				"the transaction",
+				db.transaction(async (tx) => {
+					unawaited.push(
+						tx.savepoint(async (sp) => {
+							unawaited.push(
+								sp.savepoint(async (nested) => {
+									await sleep(5);
+									await nested.query("late 2");
+								}),
+							);
+						}),
+					);
+					throw failed;
+				}),
+			),
+			failed,
+		);
+		await Promise.all(unawaited);
+		assert.deepEqual(log, [
+			"begin",
+			"tx exec: savepoint sqlkit_1",
+			"tx: late 1",
+			"tx exec: release sqlkit_1",
+			"commit",
+			"begin",
+			"tx exec: savepoint sqlkit_1",
+			"tx exec: savepoint sqlkit_2",
+			"tx: late 2",
+			"tx exec: release sqlkit_2",
+			"tx exec: release sqlkit_1",
+			"rollback",
+		]);
+	});
+
+	test("a context that outlived its savepoint is in the enclosing scope; past the transaction, a stranger", async () => {
+		const { backend, log } = stub();
+		const db = createSingleConnectionDriver(backend);
+		const afterSavepoint = gate();
+		const afterTransaction = gate();
+		const stragglers: Promise<unknown>[] = [];
+		await db.transaction(async (tx) => {
+			await tx.savepoint(async () => {
+				stragglers.push(
+					afterSavepoint.opened.then(() => db.query("in the transaction")),
+					afterTransaction.opened.then(() => db.query("a stranger")),
+				);
+			});
+			afterSavepoint.open();
+			await stragglers[0];
+		});
+		afterTransaction.open();
+		await Promise.all(stragglers);
+		assert.deepEqual(log, [
+			"begin",
+			"tx exec: savepoint sqlkit_1",
+			"tx exec: release sqlkit_1",
+			"tx: in the transaction",
+			"commit",
+			"backend: a stranger",
+		]);
+	});
+
+	test("the sync tier asks its backend for one inside a transaction of either tier, on one stack of names", async () => {
+		const { backend, log } = stub();
+		const db = createSingleConnectionDriver(backend, syncStub(log));
+		const sync = db.sync;
+		assert.ok(sync !== undefined);
+		// Outside a transaction it is a transaction.
+		sync.savepoint((tx) => tx.query("top"));
+		sync.transaction((tx) => {
+			tx.savepoint((sp) => {
+				sp.query("a");
+				sp.savepoint((nested) => nested.query("b"));
+			});
+		});
+		await db.transaction(async (tx) => {
+			await tx.savepoint(async () => {
+				sync.savepoint((sp) => sp.query("c"));
+			});
+			sync.savepoint((sp) => sp.query("d"));
+		});
+		assert.deepEqual(log, [
+			"sync begin",
+			"sync: top",
+			"sync commit",
+			"sync begin",
+			"sync savepoint sqlkit_1",
+			"sync: a",
+			"sync savepoint sqlkit_2",
+			"sync: b",
+			"sync release sqlkit_2",
+			"sync release sqlkit_1",
+			"sync commit",
+			"begin",
+			"tx exec: savepoint sqlkit_1",
+			"sync savepoint sqlkit_2",
+			"sync: c",
+			"sync release sqlkit_2",
+			"tx exec: release sqlkit_1",
+			"sync savepoint sqlkit_1",
+			"sync: d",
+			"sync release sqlkit_1",
+			"commit",
+		]);
+	});
+
+	test("pg: a failure inside a savepoint that rejects goes with it, and the transaction commits", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		let failed: unknown;
+		assert.equal(
+			await db.transaction(async (tx) => {
+				failed = await rejection(
+					"the savepoint",
+					tx.savepoint((sp) => sp.query("fail inside")),
+				);
+				return "committed";
+			}),
+			"committed",
+		);
+		assert.ok(failed instanceof BusyError, String(failed));
+		assert.deepEqual(log, ["rollback to sqlkit_1", "commit"]);
+	});
+
+	test("pg: a failure its callback swallowed undoes the savepoint, with TransactionAbortedError", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		let inner: unknown;
+		let refusal: unknown;
+		assert.equal(
+			await db.transaction(async (tx) => {
+				refusal = await rejection(
+					"the savepoint",
+					tx.savepoint(async (sp) => {
+						inner = await rejection("a failure", sp.query("fail inside"));
+						return "swallowed";
+					}),
+				);
+				return "committed";
+			}),
+			"committed",
+		);
+		assert.ok(refusal instanceof TransactionAbortedError, String(refusal));
+		assert.equal(refusal.kind, "aborted");
+		assert.match(refusal.message, /inside the savepoint/);
+		assert.ok(inner instanceof BusyError);
+		assert.equal(refusal.cause, inner);
+		// Rolled back to, not released; and the transaction, recovered, commits.
+		assert.deepEqual(log, ["rollback to sqlkit_1", "commit"]);
+	});
+
+	test("pg: a statement not awaited inside a savepoint is waited for, and counted against it", async () => {
+		const { backend, log } = aborting("pg");
+		const db = createSingleConnectionDriver(backend);
+		const refusal = await db.transaction((tx) =>
+			rejection(
+				"the savepoint",
+				tx.savepoint(async (sp) => {
+					void sp.query("fail not awaited").catch(() => undefined);
+				}),
+			),
+		);
+		assert.ok(refusal instanceof TransactionAbortedError, String(refusal));
+		assert.deepEqual(log, ["rollback to sqlkit_1", "commit"]);
+	});
+
+	test("pg: a savepoint the database would not open, release or roll back to aborts the scope around it", async () => {
+		for (const step of ["open", "release", "undo"] as const) {
+			const { backend, log } = aborting("pg", { [step]: `fail ${step}` });
+			const db = createSingleConnectionDriver(backend);
+			let refusal: unknown;
+			const error = await rejection(
+				`the transaction (${step})`,
+				db.transaction(async (tx) => {
+					refusal = await rejection(
+						`the savepoint (${step})`,
+						tx.savepoint(async () => {
+							if (step === "undo") throw new Error("the callback's own");
+							return "value";
+						}),
+					);
+					return "swallowed";
+				}),
+			);
+			// The refusal is the database's, typed, not the callback's own error.
+			assert.ok(refusal instanceof BusyError, `${step}: ${String(refusal)}`);
+			assert.equal(refusal.message, `driver failed at fail ${step}`);
+			// It is a failed statement of the transaction, which is then not committed.
+			assert.ok(
+				error instanceof TransactionAbortedError,
+				`${step}: ${String(error)}`,
+			);
+			assert.equal(error.cause, refusal);
+			assert.deepEqual(log, ["rollback"], step);
+		}
+	});
+
+	test("pg: a savepoint rolled back to recovers the scope an inner refusal aborted", async () => {
+		// The inner savepoint is not released; the outer one's callback swallows that.
+		const { backend, log } = aborting("pg", {
+			release: "fail release",
+			only: "sqlkit_2",
+		});
+		const db = createSingleConnectionDriver(backend);
+		let outer: unknown;
+		assert.equal(
+			await db.transaction(async (tx) => {
+				outer = await rejection(
+					"the outer savepoint",
+					tx.savepoint(async (sp) => {
+						await rejection(
+							"the inner savepoint",
+							sp.savepoint(async () => "value"),
+						);
+						return "swallowed";
+					}),
+				);
+				return "committed";
+			}),
+			"committed",
+		);
+		assert.ok(outer instanceof TransactionAbortedError, String(outer));
+		assert.deepEqual(log, ["rollback to sqlkit_1", "commit"]);
+	});
+
+	test("sqlite: a refused savepoint rejects, typed, and the transaction is its callback's to end", async () => {
+		const { backend, log } = aborting("sqlite", { release: "fail release" });
+		const db = createSingleConnectionDriver(backend);
+		let refusal: unknown;
+		assert.equal(
+			await db.transaction(async (tx) => {
+				refusal = await rejection(
+					"the savepoint",
+					tx.savepoint(async () => "value"),
+				);
+				return "committed";
+			}),
+			"committed",
+		);
+		assert.ok(refusal instanceof BusyError, String(refusal));
+		assert.deepEqual(log, ["commit"]);
+		// And a failure its callback swallowed is no failure of the savepoint: kept.
+		const kept = aborting("sqlite");
+		assert.equal(
+			await createSingleConnectionDriver(kept.backend).transaction((tx) =>
+				tx.savepoint(async (sp) => {
+					await rejection("a failure", sp.query("fail inside"));
+					return "kept";
+				}),
+			),
+			"kept",
+		);
+		assert.deepEqual(kept.log, ["release sqlkit_1", "commit"]);
 	});
 });

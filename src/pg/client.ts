@@ -25,6 +25,8 @@
  *   The `COMMIT`'s command tag is still checked, as on the pool, for a failure the core
  *   could not see: Postgres answers the `COMMIT` of an aborted transaction with
  *   `ROLLBACK`, and no error.
+ * - `savepoint` is `SAVEPOINT`, then `RELEASE`, or `ROLLBACK TO` when the callback
+ *   rejected, which is also what lifts the aborted state a failed statement left.
  * - `lock` is the pool driver's advisory lock (`lock.ts`), keyed by the name and the
  *   schema, so a client driver and a pool driver on the same schema exclude each other:
  *   a session lock outside a transaction, released by statement, and a transaction-scoped
@@ -45,6 +47,7 @@
 
 import { classifyPg } from "../core/classify-pg.ts";
 import type { Driver, QueryResult, Row } from "../core/contract.ts";
+import { savepointBy } from "../core/savepoint.ts";
 import type { Connection, SingleConnectionBackend } from "../single/backend.ts";
 import { createSingleConnectionDriver } from "../single/driver.ts";
 import { type LockStatement, lockKeyOf, takeLock, unlock } from "./lock.ts";
@@ -165,6 +168,11 @@ function clientBackend(
 			// The server ended the transaction itself: there is nothing to roll back.
 			if (command !== "COMMIT") throw notCommitted(command);
 			return result;
+		},
+
+		savepoint<T>(fn: () => Promise<T>, _inner: Connection, name: string): Promise<T> {
+			// Simple queries, in their turn like every other statement.
+			return savepointBy((text) => send({ text }), name, fn);
 		},
 
 		async lock(name: string, inTransaction: boolean): Promise<() => Promise<void>> {

@@ -8,7 +8,9 @@
 // option governs every checkout, have no counterpart on a single connection. Nor do the
 // last two: only Postgres aborts a transaction on a failed statement and then answers its
 // `COMMIT` with `ROLLBACK`, and a pool emits `error` for an idle client of its own (the
-// client driver's counterpart is in `client.test.ts`).
+// client driver's counterpart is in `client.test.ts`). A savepoint is held to the same
+// pin, and to what only the pool does about one Postgres would not release: it has no
+// count of failed statements, so the `RELEASE`'s refusal is what tells it.
 //
 // Suite names start with `pg/`: `pnpm run test:pg` selects them by it.
 
@@ -16,7 +18,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { describe, test } from "node:test";
 import pg from "pg";
-import { type Driver, TransactionAbortedError } from "../../src/mod.ts";
+import { type Driver, SqlError, TransactionAbortedError } from "../../src/mod.ts";
 import { createPgDriver } from "../../src/pg/mod.ts";
 import { testPgConfig } from "../_env.ts";
 import { createPgFixture, type PgFixture } from "./_fixture.ts";
@@ -184,6 +186,63 @@ describe("pg/transaction-pinning", () => {
 				),
 			);
 			assert.equal(await countRows(driver, "aborted-ok-%"), POOL_MAX);
+		}));
+
+	test("a savepoint runs on its transaction's backend, however deep, on a pool smaller than the load", () =>
+		withFixture(async ({ driver }) => {
+			const boom = new Error("boom");
+			const blocks = Array.from({ length: BLOCKS }, (_, i) =>
+				driver.transaction(async (tx) => {
+					const onTx = await backendPid(tx);
+					const [onSavepoint, onInner] = await tx.savepoint(async (sp) => {
+						await sp.query("insert into t (id) values ($1)", [`kept-${i}`]);
+						// The outer handle, and a savepoint inside this one: checking out
+						// a second client for either would deadlock the pool of three.
+						return [await backendPid(driver), await sp.savepoint(backendPid)];
+					});
+					await assert.rejects(
+						tx.savepoint(async (sp) => {
+							await sp.query("insert into t (id) values ($1)", [
+								`undone-${i}`,
+							]);
+							throw boom;
+						}),
+						(error) => error === boom,
+					);
+					return [onTx, onSavepoint, onInner];
+				}),
+			);
+			for (const [onTx, onSavepoint, onInner] of await Promise.all(blocks)) {
+				assert.equal(onSavepoint, onTx, "a savepoint left the pinned client");
+				assert.equal(onInner, onTx, "a nested savepoint left the pinned client");
+			}
+			assert.equal(await countRows(driver, "kept-%"), BLOCKS);
+			assert.equal(await countRows(driver, "undone-%"), 0);
+		}));
+
+	test("a savepoint the server would not release is rolled back to, and the transaction commits", () =>
+		withFixture(async ({ driver }) => {
+			// The savepoint's callback swallows a failed statement and returns normally.
+			// Postgres has aborted the transaction by then, and refuses the RELEASE; the
+			// driver rolls back to the savepoint instead, which recovers the transaction.
+			await driver.transaction(async (tx) => {
+				await tx.query("insert into t (id) values ($1)", ["sp-before"]);
+				await assert.rejects(
+					tx.savepoint(async (sp) => {
+						await sp.query("insert into t (id) values ($1)", ["sp-inside"]);
+						await assert.rejects(sp.query("select * from no_such_table"));
+					}),
+					(error) =>
+						error instanceof TransactionAbortedError &&
+						/inside the savepoint/.test(error.message) &&
+						// The refusal of the RELEASE itself, as the server worded it.
+						error.cause instanceof SqlError &&
+						error.cause.code === "25P02",
+				);
+				await tx.query("insert into t (id) values ($1)", ["sp-after"]);
+			});
+			assert.equal(await countRows(driver, "sp-%"), 2);
+			assert.equal(await countRows(driver, "sp-inside"), 0);
 		}));
 
 	test("a pool nobody listens to gets an error listener, and a warning", async () => {

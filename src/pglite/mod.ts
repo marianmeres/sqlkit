@@ -23,6 +23,8 @@
  *   every statement, and no write. On Postgres a failed statement aborts the whole
  *   transaction; the core refuses to commit one that a failure aborted
  *   (`TransactionAbortedError`), so PGlite rolls back instead of committing.
+ * - `savepoint` is `SAVEPOINT`, `RELEASE` and `ROLLBACK TO`, sent through the
+ *   transaction object PGlite handed out.
  * - No lock other processes honour: `exclusive` is the core's in-process queue, and a
  *   migrate run is one transaction.
  * - `close()` closes the instance (D13). A host that keeps its instance does not call it.
@@ -43,6 +45,7 @@
 
 import { classifyPg } from "../core/classify-pg.ts";
 import type { Driver, QueryResult, Row } from "../core/contract.ts";
+import { savepointBy } from "../core/savepoint.ts";
 import type { Connection, SingleConnectionBackend } from "../single/backend.ts";
 import { createSingleConnectionDriver } from "../single/driver.ts";
 
@@ -126,6 +129,11 @@ function pgliteBackend(db: PgliteLike): SingleConnectionBackend {
 				// symptom, not the cause, which is what `fn` rejected with.
 				throw failed === undefined ? error : failed.error;
 			}
+		},
+
+		savepoint<T>(fn: () => Promise<T>, inner: Connection, name: string): Promise<T> {
+			// `inner` is the connection over the transaction object: the open transaction.
+			return savepointBy((text) => inner.exec(text), name, fn);
 		},
 
 		classify: classifyPg,

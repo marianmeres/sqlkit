@@ -5,22 +5,25 @@
  *
  * `createMigrate(db)` answers a `Migrate` instance whose four hooks are the driver's:
  *
- * | Hook               | `capabilities.crossProcessLock`              | otherwise                         |
- * | ------------------ | -------------------------------------------- | --------------------------------- |
- * | `wrapRun`          | `db.exclusive("migrate:<table>", run)`       | `db.transaction(run)`             |
- * | `wrapStep`         | `db.transaction(run)`                        | `db.transaction(run)`, joining it |
- * | `getActiveVersion` | the newest row; `null` while no table exists | same                              |
- * | `setActiveVersion` | one insert, under the run lock               | same                              |
+ * | Hook               | `capabilities.crossProcessLock`              | otherwise                               |
+ * | ------------------ | -------------------------------------------- | --------------------------------------- |
+ * | `wrapRun`          | `db.exclusive("migrate:<table>", run)`       | `db.transaction(run)`                   |
+ * | `wrapStep`         | `db.savepoint(run)`: a transaction per step  | `db.savepoint(run)`: a savepoint of it  |
+ * | `getActiveVersion` | the newest row; `null` while no table exists | same                                    |
+ * | `setActiveVersion` | one insert, under the run lock               | same                                    |
  *
  * The version table is created inside the run lock, at the start of a run; a read never
  * creates it.
  *
- * **Where the lock crosses processes** (a Postgres pool or client), a run holds the
- * advisory lock and commits step by step: a failed step is undone with its version mark,
- * and the steps before it stay. **Everywhere else** the run is one transaction, because
- * there the transaction is the only lock another process honours: a failed step undoes the
- * whole run, the version table's creation included. (The package's own SQLite helper keeps
- * the earlier steps through a savepoint; this wiring has none.)
+ * **A failed step is undone alone, with its version mark, and the steps before it stay**,
+ * on every adapter. Where the lock crosses processes (a Postgres pool or client), a run
+ * holds the advisory lock and each step is a transaction of its own, committed as it
+ * ends. Everywhere else the run is one transaction, because there the transaction is the
+ * only lock another process honours, and each step is a savepoint of it: when a step
+ * fails, the transaction is committed with what the steps before it did, and the run
+ * rejects with the step's failure. The one exception is a step whose savepoint the
+ * database would not roll back to: what it did may still be in the transaction, so the
+ * whole run is rolled back instead.
  *
  * **Interop with the package's own helpers.** The version table's DDL is theirs, character
  * for character per dialect, and the run lock is named `migrate:<table>`, which gives the
@@ -30,8 +33,7 @@
  * both take for the length of a run.
  *
  * **Workers** receive `{ db, ...context }`. `db` is the driver itself: whatever a worker
- * issues through it from its own call runs inside the step's transaction, and is rolled back
- * with it. A worker must not open `BEGIN` / `COMMIT` / `ROLLBACK` itself, and cannot run a
+ * issues through it from its own call runs inside the step, and is rolled back with it. A worker must not open `BEGIN` / `COMMIT` / `ROLLBACK` itself, and cannot run a
  * statement that refuses a transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`) or that has
  * no effect inside one (SQLite's `PRAGMA foreign_keys`). A statement issued from a context
  * that is not the worker's (a callback registered before the run) is not in the step: on a
@@ -53,7 +55,7 @@ export const MIGRATE_TABLE = "__migrate__";
 
 /** The context every worker receives, next to the extra properties of `options.context`. */
 export interface MigrateContext {
-	/** The driver. Inside a step, its statements are in the step's transaction. */
+	/** The driver. Inside a step, its statements are in the step, and go with it. */
 	db: Driver;
 }
 
@@ -170,6 +172,61 @@ export function createMigrate<
 		return crossProcess ? db.exclusive(lockName, body) : db.transaction(body);
 	};
 
+	/**
+	 * Set when a failed step's savepoint could not be rolled back to: what the step did
+	 * may still be in the run's transaction, which must then not be committed.
+	 */
+	let stuck = false;
+
+	/**
+	 * A whole run where the transaction is the lock: one transaction, with the version
+	 * table in place, committed also when `run` rejects. A failed step has been undone
+	 * alone by then, to its savepoint, and what the steps before it did stays. The
+	 * rejection is `run`'s, whatever the commit after it answered.
+	 */
+	const inOneTransaction = async (run: () => Promise<void>): Promise<void> => {
+		let failed: Thrown | undefined;
+		stuck = false;
+		try {
+			await db.transaction(async () => {
+				await db.query(statements.ensure);
+				try {
+					await run();
+				} catch (error) {
+					failed = { error };
+					// Rejecting rolls the whole run back; resolving commits what stays.
+					if (stuck) throw error;
+				}
+			});
+		} catch (error) {
+			throw failed === undefined ? error : failed.error;
+		}
+		if (failed !== undefined) throw failed.error;
+	};
+
+	/**
+	 * One step as a unit: a transaction of its own under the cross-process lock, a
+	 * savepoint of the run's transaction otherwise, which is what `savepoint` is in each
+	 * place. Its rejection is the step's own failure when the step was undone; anything
+	 * else means the savepoint itself was refused.
+	 */
+	const step = async (run: () => Promise<void>): Promise<void> => {
+		let failed: Thrown | undefined;
+		try {
+			await db.savepoint(async () => {
+				try {
+					await run();
+				} catch (error) {
+					failed = { error };
+					throw error;
+				}
+			});
+		} catch (error) {
+			if (failed === undefined || error !== failed.error) stuck = true;
+			throw error;
+		}
+	};
+
 	const exists = async (): Promise<boolean> => {
 		const { rows } = await db.query<{ found: unknown }>(statements.exists, [table]);
 		// Postgres answers one row holding a boolean; SQLite a row when the table exists.
@@ -189,15 +246,15 @@ export function createMigrate<
 				return typeof version === "string" ? version : null;
 			},
 
-			// Inside a run this is the step's own transaction. Outside one (a manual
+			// Inside a run this is in its step, and goes with it. Outside one (a manual
 			// `setActiveVersion()` or `forceSetActiveVersion()`) it takes the lock itself.
 			setActiveVersion: async (version) => {
 				await locked(() => db.query(statements.write, [version ?? null]));
 			},
 
-			wrapRun: (run) => locked(run),
+			wrapRun: (run) => (crossProcess ? locked(run) : inOneTransaction(run)),
 
-			wrapStep: (run) => db.transaction(() => run()),
+			wrapStep: (run) => step(run),
 
 			logger: options.logger,
 		},
@@ -205,12 +262,17 @@ export function createMigrate<
 	);
 }
 
+/** What a callback threw, boxed, so that even a thrown `undefined` is told from none. */
+interface Thrown {
+	readonly error: unknown;
+}
+
 /** A driver, refused before anything starts when it is not shaped like one. */
 function assertDriver(db: unknown): asserts db is Driver {
 	const shaped =
 		typeof db === "object" &&
 		db !== null &&
-		["query", "exec", "transaction", "exclusive"].every(
+		["query", "exec", "transaction", "savepoint", "exclusive"].every(
 			(method) => typeof (db as Record<string, unknown>)[method] === "function",
 		) &&
 		((db as { dialect?: unknown }).dialect === "pg" ||

@@ -9,7 +9,8 @@
  *
  * Transactions are callback-shaped at this seam, not `BEGIN` / `COMMIT` statements, because
  * one backend cannot be sent `BEGIN` at all: a Durable Object refuses every transaction
- * statement and offers a callback API instead.
+ * statement and offers a callback API instead. Savepoints are callback-shaped for the
+ * same reason.
  *
  * A backend over an engine that is synchronous underneath also gives a `SyncBackend`, the
  * same connection answering at once, and the core builds `driver.sync` over it.
@@ -59,6 +60,22 @@ export interface SingleConnectionBackend extends Connection {
 	 */
 	transaction<T>(fn: (inner: Connection) => Promise<T>, readOnly: boolean): Promise<T>;
 	/**
+	 * Run `fn` in a savepoint of the open transaction: release it when `fn` resolves, roll
+	 * back to it when `fn` rejects, and answer with what `fn` answered, or with its
+	 * rejection as it was thrown. The transaction stays open either way.
+	 *
+	 * A savepoint the database would not open, release or roll back to rejects with that
+	 * refusal, a failed rollback's in place of `fn`'s rejection: the transaction goes on,
+	 * and the core has to know that the unit is still in it.
+	 *
+	 * `inner` is the connection the transaction's callback was handed, and `name` a name
+	 * no other savepoint open on it has; a backend that nests its library's own
+	 * transaction needs neither. The core calls it only inside a transaction this backend
+	 * opened, and never while another savepoint of the same depth is open: savepoints
+	 * nest, they do not overlap.
+	 */
+	savepoint<T>(fn: () => Promise<T>, inner: Connection, name: string): Promise<T>;
+	/**
 	 * A lock other processes honour, where the database has one: what makes
 	 * `capabilities.crossProcessLock` true. Resolves, once the lock is held, to its
 	 * release.
@@ -101,4 +118,14 @@ export interface SyncBackend {
 	 * back.
 	 */
 	transaction<T>(fn: () => T, readOnly: boolean): T;
+	/**
+	 * Run `fn` in a savepoint of the open transaction: release it when `fn` returns, roll
+	 * back to it when `fn` throws, and answer what `fn` answered, or throw what it threw.
+	 * What the savepoint's own statements refuse is thrown as
+	 * {@link SingleConnectionBackend.savepoint} rejects with it.
+	 *
+	 * The core calls it only while a transaction is open on the connection, whichever
+	 * tier opened it, with a `name` no other open savepoint has.
+	 */
+	savepoint<T>(fn: () => T, name: string): T;
 }

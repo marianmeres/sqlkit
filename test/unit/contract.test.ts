@@ -168,6 +168,7 @@ describe("unit/contract: the interfaces can be implemented as written", () => {
 			query: run,
 			exec: () => {},
 			transaction: (fn) => fn(sync),
+			savepoint: (fn) => fn(sync),
 		};
 		const driver: Driver = {
 			dialect: "sqlite",
@@ -179,6 +180,7 @@ describe("unit/contract: the interfaces can be implemented as written", () => {
 			) => run<T>(statement, params),
 			exec: async () => {},
 			transaction: (fn) => fn(driver),
+			savepoint: (fn) => fn(driver),
 			exclusive: (_name, fn) => fn(driver),
 			close: async () => {},
 			sync,

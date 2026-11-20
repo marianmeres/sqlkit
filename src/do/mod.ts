@@ -20,6 +20,9 @@
  *   `COMMIT` and `ROLLBACK`. The async tier's transaction is `storage.transaction`, the
  *   sync tier's `storage.transactionSync`. A script given to `exec`, a migration's
  *   included, cannot hold a transaction statement of its own.
+ * - **A savepoint is a transaction inside the open one** (F07, F08, F16): workerd nests
+ *   `storage.transaction` and `storage.transactionSync`, either inside either, and undoes
+ *   the inner one alone when its closure throws. `savepoint` is that, on each tier.
  * - **An open async transaction holds the whole object** (F14): workerd lets no other
  *   request in until it settles, even while it awaits a timer or a `fetch`. So an async
  *   transaction must not await external I/O: do the I/O first, then open it.
@@ -107,8 +110,8 @@ export function createDoDriver(storage: DoStorageLike): Driver {
 
 /** A read-only transaction in progress: what it saw when it began, and what it refused. */
 interface ReadOnlyWatch {
-	/** `total_changes()` when the transaction began. */
-	readonly baseline: number;
+	/** `total_changes()` when the transaction began, or when a savepoint took a write back. */
+	baseline: number;
 	/** The refusal of the first write it saw, thrown again when the callback returns. */
 	refused: Error | undefined;
 }
@@ -186,6 +189,18 @@ function doBackends(storage: DoStorageLike): {
 		if (watch?.refused !== undefined) throw watch.refused;
 	};
 
+	/**
+	 * A savepoint was undone, in a read-only transaction that had refused `before` when
+	 * the savepoint opened. A write refused inside it went with it, so the transaction is
+	 * as it was: it remembers what it did then, and counts changes from here, since
+	 * `total_changes()` keeps what a rollback took back.
+	 */
+	const forget = (before: Error | undefined): void => {
+		if (watch === undefined || watch.refused === before) return;
+		watch.refused = before;
+		watch.baseline = totalChanges();
+	};
+
 	const backend: SingleConnectionBackend = {
 		dialect: "sqlite",
 		adapter: "durable-objects",
@@ -220,6 +235,29 @@ function doBackends(storage: DoStorageLike): {
 			}
 		},
 
+		async savepoint<T>(fn: () => Promise<T>): Promise<T> {
+			assertOpen();
+			const refused = watch?.refused;
+			/** What `fn` rejected with, boxed, so that even a rejected `undefined` counts. */
+			let failed: { error: unknown } | undefined;
+			try {
+				// Inside the open transaction this is a savepoint of it (F08). The
+				// read-only watch is the open transaction's, and goes on.
+				return await storage.transaction(async () => {
+					try {
+						return await fn();
+					} catch (error) {
+						failed = { error };
+						throw error;
+					}
+				});
+			} catch (error) {
+				forget(refused);
+				// The callback's own rejection, as it was, whatever workerd rethrew.
+				throw failed === undefined ? error : failed.error;
+			}
+		},
+
 		classify: classifySqlite,
 
 		close(): void {
@@ -241,6 +279,18 @@ function doBackends(storage: DoStorageLike): {
 				});
 			} finally {
 				watch = undefined;
+			}
+		},
+		savepoint<T>(fn: () => T): T {
+			assertOpen();
+			const refused = watch?.refused;
+			try {
+				// Inside the open transaction, whichever tier opened it, this is a
+				// savepoint of it (F07, F16).
+				return storage.transactionSync(fn);
+			} catch (error) {
+				forget(refused);
+				throw error;
 			}
 		},
 	};

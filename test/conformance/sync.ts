@@ -1,13 +1,20 @@
 // The `sync` conformance body: the sync tier (`driver.sync`) and the rules S1–S6 of what the
 // two tiers refuse of each other (plan doc 02 #3, D03, D16), on every registered adapter
 // that has one. An adapter the registry marks as having none is held to that instead.
+// The sync savepoint (backlog T26) is held to the driver body's R12, and to S1–S5.
 //
 // Runner-agnostic: no `node:test` here, so the same cases run inside workerd. Every case
 // creates and disposes a database of its own. A refusal on the sync tier is a `TypeError`
 // thrown at the call; one on the async tier is a promise that rejects with it (R1).
 
 import assert from "node:assert/strict";
-import { type Driver, type QueryResult, type SyncDriver, sql } from "../../src/mod.ts";
+import {
+	type Driver,
+	type QueryResult,
+	SqlError,
+	type SyncDriver,
+	sql,
+} from "../../src/mod.ts";
 import type { AdapterCase, Suite } from "./_suite.ts";
 
 /** A promise and the function that resolves it: a gate a case opens by hand. */
@@ -324,6 +331,126 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 		assert.equal(count(tier), 1);
 	});
 
+	// ── Savepoints ──────────────────────────────────────────────────────────────────
+
+	test("savepoint: a sync savepoint is kept when its callback returns, and undone alone when it throws", (tier) => {
+		const boom = new Error("boom");
+		tier.transaction((tx) => {
+			insert(tx, "before");
+			const value = tx.savepoint((sp) => {
+				assert.equal(
+					sp,
+					tier,
+					"the savepoint's callback was handed another handle",
+				);
+				insert(sp, "kept");
+				return "inner value";
+			});
+			assert.equal(value, "inner value");
+			assert.throws(
+				() =>
+					tx.savepoint((sp) => {
+						insert(sp, "undone-query");
+						sp.exec("insert into t (id, name) values ('undone-exec', 'x')");
+						assert.equal(count(sp), 4);
+						throw boom;
+					}),
+				(error) => error === boom,
+			);
+			assert.equal(count(tx), 2, "the savepoint's writes outlived it");
+			// A statement that fails inside one goes with it, and the transaction goes on.
+			assert.throws(
+				() =>
+					tx.savepoint((sp) => {
+						insert(sp, "undone-with-the-failure");
+						insert(sp, "kept");
+					}),
+				(error) => error instanceof SqlError && error.kind === "unique",
+			);
+			insert(tx, "after");
+		});
+		assert.equal(count(tier), 3);
+		for (const id of ["before", "kept", "after"]) assert.equal(count(tier, id), 1);
+	});
+
+	test("savepoint: sync savepoints nest; outside a transaction one is a transaction of its own", (tier) => {
+		const inner = new Error("inner failed");
+		const outer = new Error("outer failed");
+		tier.transaction((tx) => {
+			tx.savepoint((a) => {
+				insert(a, "a");
+				assert.throws(
+					() =>
+						a.savepoint((b) => {
+							insert(b, "b-undone");
+							throw inner;
+						}),
+					(error) => error === inner,
+				);
+				a.savepoint((b) => insert(b, "b-kept"));
+			});
+			assert.throws(
+				() =>
+					tx.savepoint((c) => {
+						insert(c, "c");
+						// Released into the one around it, and undone with that one.
+						c.savepoint((d) => insert(d, "d"));
+						// A nested transaction joins the savepoint it is in (S2).
+						c.transaction((joined) => insert(joined, "joined"));
+						assert.equal(count(c), 5);
+						throw outer;
+					}),
+				(error) => error === outer,
+			);
+			assert.equal(count(tx), 2);
+		});
+		assert.equal(count(tier), 2);
+		assert.equal(count(tier, "a"), 1);
+		assert.equal(count(tier, "b-kept"), 1);
+
+		// Outside a transaction: a transaction, committed or rolled back as one.
+		const value = tier.savepoint((tx) => {
+			insert(tx, "top-kept");
+			return "value";
+		});
+		assert.equal(value, "value");
+		assert.throws(
+			() =>
+				tier.savepoint((tx) => {
+					insert(tx, "top-undone");
+					throw outer;
+				}),
+			(error) => error === outer,
+		);
+		assert.equal(count(tier, "top-kept"), 1);
+		assert.equal(count(tier, "top-undone"), 0);
+		// The connection is in no transaction afterwards.
+		tier.transaction((tx) => insert(tx, "after"));
+		assert.equal(count(tier), 4);
+	});
+
+	test("savepoint: in a read-only sync transaction it reads, and a write it refused is undone with it", (tier) => {
+		insert(tier, "seed");
+		tier.transaction(
+			(tx) => {
+				assert.equal(
+					tx.savepoint((sp) => count(sp)),
+					1,
+				);
+				assert.throws(
+					() => tx.savepoint((sp) => insert(sp, "written")),
+					READ_ONLY,
+				);
+				// The transaction is as it was: it reads on, and ends without a failure.
+				assert.equal(count(tx), 1);
+			},
+			{ readOnly: true },
+		);
+		assert.equal(count(tier, "written"), 0);
+		insert(tier, "after");
+		assert.equal(count(tier), 2);
+	});
+
 	// ── S1–S6 ───────────────────────────────────────────────────────────────────────
 
 	test("S1: a sync transaction whose callback returns a thenable rolls back, with a TypeError", (tier) => {
@@ -371,6 +498,41 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 		// The connection is in no transaction afterwards.
 		tier.transaction((tx) => insert(tx, "after"));
 		assert.equal(count(tier), 1);
+	});
+
+	test("S1: a sync savepoint whose callback returns a thenable is undone, with a TypeError", (tier) => {
+		tier.transaction((tx) => {
+			insert(tx, "before");
+			// Everything before its first await ran inside, and is undone; the
+			// transaction goes on.
+			assert.throws(
+				() =>
+					tx.savepoint(async (sp) => {
+						insert(sp, "async-callback");
+					}),
+				typeError(/promise/),
+			);
+			assert.equal(count(tx, "async-callback"), 0);
+			assert.throws(
+				() =>
+					tx.savepoint(async (sp) => {
+						insert(sp, "async-rejected");
+						throw new Error("inside");
+					}),
+				typeError(/promise/),
+			);
+			insert(tx, "after");
+		});
+		assert.equal(count(tier), 2);
+		// Outside a transaction, where it is one.
+		assert.throws(
+			() =>
+				tier.savepoint(async (tx) => {
+					insert(tx, "top");
+				}),
+			typeError(/promise/),
+		);
+		assert.equal(count(tier, "top"), 0);
 	});
 
 	test("S2: a nested sync transaction joins the open one, as it was opened", (tier) => {
@@ -462,6 +624,63 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 		assert.equal(count(tier, "sync-committed"), 1);
 	});
 
+	test("S3: a sync savepoint inside an open async transaction's own context is a savepoint of it", async (tier, db) => {
+		const boom = new Error("boom");
+		await db.transaction(async (tx) => {
+			await insertAsync(tx, "async-row");
+			// Across a real timer: the context is still the transaction's.
+			await sleep(5);
+			const seen = tier.savepoint((sp) => {
+				insert(sp, "sync-kept");
+				return count(sp);
+			});
+			assert.equal(seen, 2);
+			assert.throws(
+				() =>
+					tier.savepoint((sp) => {
+						insert(sp, "sync-undone");
+						throw boom;
+					}),
+				(error) => error === boom,
+			);
+			assert.equal(count(tier), 2);
+			// Inside an async savepoint's own context it is a savepoint of that one.
+			await tx.savepoint(async (asyncSavepoint) => {
+				await insertAsync(asyncSavepoint, "async-savepoint-row");
+				assert.throws(
+					() =>
+						tier.savepoint((sp) => {
+							insert(sp, "nested-undone");
+							throw boom;
+						}),
+					(error) => error === boom,
+				);
+				tier.savepoint((sp) => insert(sp, "nested-kept"));
+			});
+			await insertAsync(tx, "after");
+		});
+		for (const id of [
+			"async-row",
+			"sync-kept",
+			"async-savepoint-row",
+			"nested-kept",
+			"after",
+		]) {
+			assert.equal(count(tier, id), 1, `${id} is missing`);
+		}
+		assert.equal(count(tier), 5);
+
+		// A sync savepoint that was kept goes with the async transaction's rollback.
+		await assert.rejects(
+			db.transaction(async () => {
+				tier.savepoint((sp) => insert(sp, "gone"));
+				throw boom;
+			}),
+			(error) => error === boom,
+		);
+		assert.equal(count(tier, "gone"), 0);
+	});
+
 	test("S4: a sync call while an async transaction is open, from any other context, is a TypeError", async (tier, db) => {
 		const inside = gate();
 		const finish = gate();
@@ -490,7 +709,14 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 					}),
 				typeError(/async transaction/),
 			);
-			assert.equal(ran, false, "the refused transaction's callback ran");
+			assert.throws(
+				() =>
+					tier.savepoint(() => {
+						ran = true;
+					}),
+				typeError(/async transaction/),
+			);
+			assert.equal(ran, false, "a refused callback ran");
 		} finally {
 			// A failed assertion fails the case; it must not leave the transaction open,
 			// and the fixture's close() queued behind it, for ever.
@@ -502,6 +728,58 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 		assert.equal(count(tier, "stranger"), 0);
 		assert.equal(count(tier, "stranger-exec"), 0);
 		insert(tier, "after");
+		assert.equal(count(tier, "after"), 1);
+	});
+
+	test("S4: a sync call from an async transaction while a savepoint opened there runs is a TypeError", async (tier, db) => {
+		const entered = gate();
+		const proceed = gate();
+		let ran = false;
+		await db.transaction(async (tx) => {
+			const savepoint = tx.savepoint(async (sp) => {
+				await insertAsync(sp, "inside");
+				// From the savepoint's own callback the sync tier is inside it (S3).
+				insert(tier, "sync-inside");
+				entered.open();
+				await proceed.opened;
+			});
+			await entered.opened;
+			try {
+				// From the transaction, outside the savepoint's callback: a sync call
+				// cannot wait for the savepoint to end, and would run inside it.
+				assert.throws(
+					() => tier.query("select 1 as one"),
+					typeError(/savepoint/),
+				);
+				assert.throws(() => insert(tier, "outside"), typeError(/savepoint/));
+				assert.throws(
+					() =>
+						tier.exec(
+							"insert into t (id, name) values ('outside-exec', 'x')",
+						),
+					typeError(/savepoint/),
+				);
+				for (const call of ["transaction", "savepoint"] as const) {
+					assert.throws(
+						() =>
+							tier[call](() => {
+								ran = true;
+							}),
+						typeError(/savepoint/),
+					);
+				}
+				assert.equal(ran, false, "a refused callback ran");
+			} finally {
+				proceed.open();
+			}
+			await savepoint;
+			// Once it has ended, the sync tier is the transaction's again.
+			insert(tier, "after");
+		});
+		assert.equal(count(tier, "inside"), 1);
+		assert.equal(count(tier, "sync-inside"), 1);
+		assert.equal(count(tier, "outside"), 0);
+		assert.equal(count(tier, "outside-exec"), 0);
 		assert.equal(count(tier, "after"), 1);
 	});
 
@@ -517,6 +795,11 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 				promiseOf("transaction", () =>
 					db.transaction(async (inner) => {
 						await insertAsync(inner, "async-transaction");
+					}),
+				),
+				promiseOf("savepoint", () =>
+					db.savepoint(async (inner) => {
+						await insertAsync(inner, "async-savepoint");
 					}),
 				),
 				promiseOf("exclusive", () =>
@@ -539,6 +822,7 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 			"async-query",
 			"async-exec",
 			"async-transaction",
+			"async-savepoint",
 			"async-exclusive",
 		]) {
 			assert.equal(count(tier, id), 0, `${id} ran after all`);
@@ -558,6 +842,33 @@ export function syncContract(suite: Suite, adapter: AdapterCase): void {
 			);
 		});
 		assert.equal(count(tier, "joined-async"), 0);
+
+		// And from a sync savepoint's callback, in a sync transaction or in an async one.
+		const inSavepoint: Promise<unknown>[] = [];
+		tier.transaction((tx) => {
+			tx.savepoint(() => {
+				inSavepoint.push(
+					promiseOf("query", () => insertAsync(db, "savepoint-async")),
+				);
+			});
+		});
+		const refusedInSavepoint = inSavepoint.map((answer) =>
+			assert.rejects(answer, typeError(/sync transaction/)),
+		);
+		await db.transaction(async () => {
+			let refused: Promise<unknown> | undefined;
+			tier.savepoint(() => {
+				refused = promiseOf("savepoint", () =>
+					db.savepoint(() => insertAsync(db, "savepoint-async")),
+				);
+			});
+			await assert.rejects(
+				refused ?? assert.fail("the savepoint's callback did not run"),
+				typeError(/sync transaction/),
+			);
+		});
+		await Promise.all(refusedInSavepoint);
+		assert.equal(count(tier, "savepoint-async"), 0);
 	});
 
 	test("S6: a sync call while async statements are queued, and no transaction is open, runs at once", async (tier, db) => {

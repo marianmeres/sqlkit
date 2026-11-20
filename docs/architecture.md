@@ -60,8 +60,9 @@ query(statement | text, params?)
 | ------------------------ | ---------------------------------------------------------------------------- |
 | `src/core/sql.ts`        | `Sql` fragments, `render`, `ident`, `json`, quoting                          |
 | `src/core/params.ts`     | the parameter rule (`normalizeParam`, `normalizeParams`)                     |
-| `src/core/contract.ts`   | `Driver`, `SyncDriver`, R1–R11 and S1–S6 in doc comments, `statementOf`      |
+| `src/core/contract.ts`   | `Driver`, `SyncDriver`, R1–R12 and S1–S6 in doc comments, `statementOf`      |
 | `src/core/errors.ts`     | `SqlError`, its subclasses, `toSqlError`                                     |
+| `src/core/savepoint.ts`  | a savepoint by statement, for the adapters whose database takes `SAVEPOINT`  |
 | `src/core/classify-*.ts` | one classifier per dialect: driver error → `SqlErrorInfo`                    |
 | `src/core/build.ts`      | `insert`, `update`, `upsert`, `deleteFrom`, `whereEq`, `and`, `or`, `inList` |
 | `src/core/decode.ts`     | `decode.*`, `decodeRow`, `decodeRows`                                        |
@@ -88,20 +89,37 @@ Durable Object's storage are backends under it; a backend only runs what it is h
   outside it.
 - A nested `transaction()` joins the open one. The backend is asked for a transaction only
   at the top level.
+- `savepoint()` inside an open transaction is a scope of its own, one level down: the
+  backend is asked for a savepoint (`backend.savepoint`), and a statement runs inside it
+  only when the savepoint's own callback issued it. What the enclosing scope issues
+  meanwhile (a statement, a script, a lock, another savepoint) waits for the savepoint to
+  end, in the order issued. Outside a transaction `savepoint()` is `transaction()`.
+- A scope ends only once what its context sent has settled, a savepoint that was not
+  awaited included: nothing of a transaction runs after the backend ended it. A context
+  that outlived its savepoint is in the scope around it.
+- The savepoints open on a connection are one stack, on either tier, named by depth
+  (`sqlkit_1`, `sqlkit_2`, …).
 - The `tx` a callback receives is the driver itself: the context decides, not the handle.
 - **Known cost:** a statement issued during a transaction from a context that lost it (a
   callback handed to an emitter or a queue created outside) waits for the transaction that
   waits for it. Bind such a callback inside the transaction (`AsyncLocalStorage.bind`).
 - On the `pg` dialect the core tracks a failed statement: a transaction whose last
   failure no later statement got past rejects with `TransactionAbortedError` (the failure
-  as `cause`) instead of committing. SQLite has no aborted state.
+  as `cause`) instead of committing. SQLite has no aborted state. The count is per scope:
+  a savepoint whose callback swallowed a failure is rolled back to, not released, which
+  recovers the transaction, and rejects the same way. A savepoint the database would not
+  open, release or roll back to is a failed statement of the scope it was opened in.
 - `exclusive()` is an in-process queue per lock name, plus `backend.lock` where the
   backend has one (then `capabilities.crossProcessLock` is true). Inside an open
   transaction it runs at once.
 
 The pool driver (`src/pg/pool.ts`) keeps the same contract its own way: `transaction()`
 pins one pooled connection and carries it through `AsyncLocalStorage`; a statement from
-outside runs on another connection at once.
+outside runs on another connection at once. A savepoint is a pin of its own on the
+transaction's client, with the same turn-taking and the same wait at the end. The pool
+keeps no count of failed statements: a `RELEASE` Postgres refused in an aborted
+transaction is what tells it that the callback swallowed a failure, and it rolls back to
+the savepoint and rejects with `TransactionAbortedError`.
 
 ## Adapters
 
@@ -121,8 +139,10 @@ outside runs on another connection at once.
   its client does not call it. On Durable Objects it ends the driver only: the storage is
   the object's.
 - **node:sqlite**: a transaction is `BEGIN IMMEDIATE`; a read-only one a deferred `BEGIN`
-  with `query_only` on. `createSqliteDriver` sets nothing on the handle; `openSqlite` sets
-  a busy timeout (5000 ms) and WAL for a file.
+  with `query_only` on. A savepoint is `SAVEPOINT`. `createSqliteDriver` sets nothing on
+  the handle; `openSqlite` sets a busy timeout (5000 ms) and WAL for a file. The driver
+  knows the transactions opened through it only: inside one the host opened on the handle
+  itself, `transaction()` and `savepoint()` are refused by SQLite.
 - **node:sqlite keeps statements** (`statementCache`: 128 in `openSqlite`, 0 in
   `createSqliteDriver`). A query or a data change, told by its first word, is compiled
   once and kept by its text, the least recently used dropped; both tiers share them.
@@ -130,7 +150,9 @@ outside runs on another connection at once.
     it. Where it does not, the driver empties the cache: after any text that is not kept
     (a pragma, DDL) and after any `exec` script. A table made in `main` stands in front
     of an attached one of its name, and a pragma can change what a statement returns.
-    A transaction's own statements go to the handle and empty nothing.
+    A transaction's own statements, and a savepoint's, go to the handle and empty
+    nothing; SQLite recompiles every statement after a rollback took a schema change
+    back.
   - What only the host can change, on its handle, is not seen: an authorizer's changed
     answer, a session opened, a function overload or module registered, a limit lowered.
     Hence the 0 for a handle the host keeps.
@@ -142,7 +164,9 @@ outside runs on another connection at once.
     `rereadsColumns` asks the runtime once.
 - **Postgres**: a read-only transaction is `REPEATABLE READ READ ONLY`. `COMMIT` is
   checked, not trusted (Postgres answers an aborted transaction's `COMMIT` with
-  `ROLLBACK`). `exclusive` is an advisory lock keyed by the name and `current_schema()`,
+  `ROLLBACK`). A savepoint is `SAVEPOINT`, `RELEASE` and `ROLLBACK TO`, the last two in
+  one simple query when it is undone; a transaction-scoped lock taken inside a savepoint
+  that is rolled back to is released with it. `exclusive` is an advisory lock keyed by the name and `current_schema()`,
   polled with `pg_try_advisory_lock`. `options.schema` binds the driver to one schema.
   `query()` uses the extended protocol, so a text of several statements is refused by the
   server; `exec()` is a simple query.
@@ -155,18 +179,23 @@ outside runs on another connection at once.
 over a SQLite-backed Durable Object's storage, with a `SyncBackend` too, since `sql.exec`
 is synchronous. It needs the `nodejs_compat` compatibility flag, for `AsyncLocalStorage`
 (D24). Everything it does differently was observed in real workerd first: findings
-F01–F15 in [DO-FINDINGS.md](./_archive/plans/v0-foundation/DO-FINDINGS.md), each pinned by
+F01–F16 in [DO-FINDINGS.md](./_archive/plans/v0-foundation/DO-FINDINGS.md), each pinned by
 `test/do/probe.test.ts`, with the workerd version it was observed on.
 
 - **Transactions** are `storage.transaction` (async tier) and `storage.transactionSync`
   (sync tier): workerd refuses every transaction statement through `sql.exec` (F04).
+- **A savepoint is the same call inside the open transaction**: workerd nests each form
+  inside itself and the sync one inside the async one, and undoes the inner one alone
+  when its closure throws (F07, F08, F16). No `SAVEPOINT` is sent.
 - **An open async transaction holds the whole object** (F14): no other request runs until
   it settles. An async transaction must not await external I/O.
 - **Read-only by detection** (F12, D34.7): `query_only` is not authorized. Inside a
   read-only transaction a statement that wrote (`rowsWritten` of the text's last
   statement, or a move of `total_changes()`) throws a `ReadOnlyError` with code `8`, and
   the transaction throws it again after the callback, inside the storage transaction, so
-  the write rolls back. DDL that is not a text's last statement goes unseen.
+  the write rolls back. A write refused inside a savepoint that is then undone went with
+  it: the transaction forgets it, and counts changes from there. DDL that is not a text's
+  last statement goes unseen.
 - **R11 is not enforced** (F01): `sql.exec` runs every statement of a text given no values.
 - **A deferred constraint resets the object** (F15): workerd checks it when the request's
   implicit transaction commits, not when `transaction()` ends.
@@ -192,14 +221,14 @@ tiers share one connection, so each refuses what would land in the wrong transac
 rules, as `src/core/contract.ts` states them and `test/conformance/sync.ts` holds every
 adapter to:
 
-| Rule | Behaviour                                                                                                                          |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| S1   | A transaction callback that returns a thenable rolls back, with a `TypeError`.                                                     |
-| S2   | A nested `transaction` joins the open one, as it was opened.                                                                       |
-| S3   | A sync call from inside an open async transaction's own callback runs inside that transaction.                                     |
-| S4   | A sync call while an async transaction is open, from anywhere else, is a `TypeError`.                                              |
-| S5   | An async call from inside a sync transaction's callback rejects with a `TypeError`: it could only run after the callback returned. |
-| S6   | With no transaction open, a sync call runs at once, ahead of queued async work.                                                    |
+| Rule | Behaviour                                                                                                                                                                                        |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| S1   | A transaction or savepoint callback that returns a thenable is undone, with a `TypeError`.                                                                                                       |
+| S2   | A nested `transaction` joins the open one, as it was opened.                                                                                                                                     |
+| S3   | A sync call from inside an open async transaction's own callback runs inside that transaction; a sync `savepoint` there is a savepoint of it.                                                    |
+| S4   | A sync call while an async transaction is open, from anywhere else, is a `TypeError`. So is one from inside it while a savepoint opened there is running, from outside the savepoint's callback. |
+| S5   | An async call from inside a sync transaction's or savepoint's callback rejects with a `TypeError`: it could only run after the callback returned.                                                |
+| S6   | With no transaction open, a sync call runs at once, ahead of queued async work.                                                                                                                  |
 
 A refused sync call throws its `TypeError` at the call.
 
@@ -208,19 +237,20 @@ A refused sync call throws its `TypeError` at the call.
 As `src/core/contract.ts` states them; `test/conformance/driver.ts` has at least one case
 per rule, named `R<n>: …`.
 
-| Rule | Behaviour                                                                                                                                                                  |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1   | `query` and `exec` always answer with a promise: a failing statement rejects, it never throws at the call.                                                                 |
-| R2   | `rowCount` is as `QueryResult` says, for a `SELECT`, a plain write and a write with `RETURNING`.                                                                           |
-| R3   | `transaction` commits when `fn` resolves and rolls back when it rejects. On `pg` a callback that swallowed a failure gets a rejection; SQLite commits the rest.            |
-| R4   | A nested `transaction` joins the open one, as it was opened.                                                                                                               |
-| R5   | A statement belongs to the transaction whose callback issued it, and to no other.                                                                                          |
-| R6   | "Inside" ends when the callback settles: a promise that outlives its transaction writes outside it.                                                                        |
-| R7   | `readOnly` reads one snapshot and refuses a write.                                                                                                                         |
-| R8   | `exclusive` serializes callers of one name, is re-entrant, lets two names run together, releases on rejection, and inside an open transaction belongs to that transaction. |
-| R9   | `exec` runs every statement of a script and joins the open transaction.                                                                                                    |
-| R10  | Parameters follow the one parameter rule. Rows are plain objects. Bytes read back as a `Uint8Array`.                                                                       |
-| R11  | `query` runs one statement: a text holding more is refused before any of it runs. A script goes through `exec`. Not on Durable Objects (F01).                              |
+| Rule | Behaviour                                                                                                                                                                                                                                                                                                                                                                            |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| R1   | `query` and `exec` always answer with a promise: a failing statement rejects, it never throws at the call.                                                                                                                                                                                                                                                                           |
+| R2   | `rowCount` is as `QueryResult` says, for a `SELECT`, a plain write and a write with `RETURNING`.                                                                                                                                                                                                                                                                                     |
+| R3   | `transaction` commits when `fn` resolves and rolls back when it rejects. On `pg` a callback that swallowed a failure gets a rejection; SQLite commits the rest.                                                                                                                                                                                                                      |
+| R4   | A nested `transaction` joins the open one, as it was opened.                                                                                                                                                                                                                                                                                                                         |
+| R5   | A statement belongs to the transaction whose callback issued it, and to no other.                                                                                                                                                                                                                                                                                                    |
+| R6   | "Inside" ends when the callback settles: a promise that outlives its transaction writes outside it.                                                                                                                                                                                                                                                                                  |
+| R7   | `readOnly` reads one snapshot and refuses a write.                                                                                                                                                                                                                                                                                                                                   |
+| R8   | `exclusive` serializes callers of one name, is re-entrant, lets two names run together, releases on rejection, and inside an open transaction belongs to that transaction.                                                                                                                                                                                                           |
+| R9   | `exec` runs every statement of a script and joins the open transaction.                                                                                                                                                                                                                                                                                                              |
+| R10  | Parameters follow the one parameter rule. Rows are plain objects. Bytes read back as a `Uint8Array`.                                                                                                                                                                                                                                                                                 |
+| R11  | `query` runs one statement: a text holding more is refused before any of it runs. A script goes through `exec`. Not on Durable Objects (F01).                                                                                                                                                                                                                                        |
+| R12  | `savepoint` runs `fn` as a unit of the open transaction: kept when it resolves, undone alone when it rejects, and the transaction goes on. Savepoints nest, and two opened at once run one after the other; what the transaction issues meanwhile waits. On `pg` a callback that swallowed a failure gets a rejection, and the savepoint is undone. Outside a transaction it is one. |
 
 A non-write's `rowCount` (DDL, a `SET`, a pragma) is a number and nothing more.
 
@@ -249,13 +279,15 @@ A non-write's `rowCount` (DDL, a `SET`, a pragma) is a number and nothing more.
 `createMigrate(db, options)` (`src/migrate/mod.ts`) is a `@marianmeres/migrate` instance
 whose hooks are the driver's:
 
-| Hook       | `crossProcessLock` true (pg, pg-client)   | otherwise (node:sqlite, PGlite, DO)    |
-| ---------- | ----------------------------------------- | -------------------------------------- |
-| `wrapRun`  | `db.exclusive("migrate:<table>", run)`    | `db.transaction(run)`                  |
-| `wrapStep` | `db.transaction(run)`, committed per step | `db.transaction(run)`, joining the run |
+| Hook       | `crossProcessLock` true (pg, pg-client)     | otherwise (node:sqlite, PGlite, DO)         |
+| ---------- | ------------------------------------------- | ------------------------------------------- |
+| `wrapRun`  | `db.exclusive("migrate:<table>", run)`      | `db.transaction(run)`                       |
+| `wrapStep` | `db.savepoint(run)`: a transaction per step | `db.savepoint(run)`: a savepoint of the run |
 
-- Where the lock crosses processes a failed step is undone alone; elsewhere it undoes the
-  whole run.
+- A failed step is undone alone on every adapter, and the steps before it stay. Where the
+  run is one transaction it is committed with them, and rejects with the step's failure
+  afterwards. A step whose savepoint could not be rolled back to takes the whole run with
+  it.
 - The version table's DDL and the lock name match the package's own helpers, so either can
   continue the other's database.
 - One active version is stored, not a ledger: a version registered later below the active
