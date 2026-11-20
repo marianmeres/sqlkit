@@ -37,9 +37,9 @@ npm install @marianmeres/sqlkit
 ```
 
 Node 24.20 or later on the 24 line, or 26.6 or later; not 25. An earlier `node:sqlite`
-misreads a statement's columns after a schema change. Then the client of your database,
-which you build and hand to the adapter: sqlkit imports no driver and has no peer
-dependency.
+misreads a statement's columns after a schema change. The package is ES modules, and
+`require()` loads every entry point too. Then the client of your database, which you build
+and hand to the adapter: sqlkit imports no driver and has no peer dependency.
 
 | Database                 | Client to install                                    |
 | ------------------------ | ---------------------------------------------------- |

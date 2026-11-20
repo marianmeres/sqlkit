@@ -4,7 +4,9 @@
 
 - One subpath export per entry point: `src/mod.ts` is `"."`, `src/<adapter>/mod.ts` is
   `"./<adapter>"`, `src/migrate/files.ts` is `"./migrate/files"`. `package.json`'s
-  `exports` maps each to `dist/`.
+  `exports` maps each to `dist/`, under `types` and then `default`: `default` is the
+  condition `import` and `require()` both match, where `import` alone leaves `require()`
+  with no entry point.
 - `src/core/` is the runtime-neutral core; `src/single/` the single-connection driver
   core; an adapter's files live in its own directory.
 - Every module opens with a header doc comment: purpose, invariants, what it imports.
@@ -171,6 +173,9 @@ if (error.code === "23505" || /UNIQUE constraint failed/.test(error.message)) â€
   `src/single/` adds `node:async_hooks` and nothing else. `test/unit/core-imports.test.ts`
   checks both.
 - No `https:`, `jsr:` or `npm:` specifiers. npm is the registry; no JSR.
+- ES modules, which `require()` loads too. So no top-level `await` under `src/`:
+  `require()` refuses a module that has one, anywhere in an entry point's graph.
+  `test/unit/exports.test.ts` loads every entry point both ways.
 - `@marianmeres/migrate` is the one runtime dependency. A database client is a dev
   dependency, for the tests.
 - `pnpm run format` before committing; `pnpm run ci` must pass.

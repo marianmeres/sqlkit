@@ -18,31 +18,31 @@
   "exports": {
     ".": {
       "types": "./dist/mod.d.ts",
-      "import": "./dist/mod.js"
+      "default": "./dist/mod.js"
     },
     "./sqlite": {
       "types": "./dist/sqlite/mod.d.ts",
-      "import": "./dist/sqlite/mod.js"
+      "default": "./dist/sqlite/mod.js"
     },
     "./pg": {
       "types": "./dist/pg/mod.d.ts",
-      "import": "./dist/pg/mod.js"
+      "default": "./dist/pg/mod.js"
     },
     "./pglite": {
       "types": "./dist/pglite/mod.d.ts",
-      "import": "./dist/pglite/mod.js"
+      "default": "./dist/pglite/mod.js"
     },
     "./do": {
       "types": "./dist/do/mod.d.ts",
-      "import": "./dist/do/mod.js"
+      "default": "./dist/do/mod.js"
     },
     "./migrate": {
       "types": "./dist/migrate/mod.d.ts",
-      "import": "./dist/migrate/mod.js"
+      "default": "./dist/migrate/mod.js"
     },
     "./migrate/files": {
       "types": "./dist/migrate/files.d.ts",
-      "import": "./dist/migrate/files.js"
+      "default": "./dist/migrate/files.js"
     }
   },
   "files": [

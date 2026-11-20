@@ -24,7 +24,7 @@ of the single-connection driver core. A pool of many connections is not: follow
    `savepointBySync`); the core builds `driver.sync` over it.
 5. Export `create<Name>Driver(client)`, which refuses a value of the wrong shape with a
    `TypeError` and returns `createSingleConnectionDriver(backend, sync?)`.
-6. `package.json`: add `"./<name>"` to `exports` (`types` and `import` under `dist/`); add
+6. `package.json`: add `"./<name>"` to `exports` (`types` and `default` under `dist/`); add
    the client library to `devDependencies` only; add a `test:<name>` script on the pattern
    of `test:pglite` (`--test-name-pattern="^<name>\\b"`, reading `test/conformance/` and
    `test/<name>/`).

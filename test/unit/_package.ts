@@ -62,7 +62,7 @@ export interface EntryPoint {
 	readonly key: string;
 	/** The import specifier: `@marianmeres/sqlkit/pg`. */
 	readonly specifier: string;
-	/** The source of its `import` target: `src/pg/mod.ts`; `null` when it maps to none. */
+	/** The source of the file it loads: `src/pg/mod.ts`; `null` when it maps to none. */
 	readonly source: string | null;
 }
 
@@ -76,8 +76,8 @@ export function entryPointsOf(pkg: Record<string, unknown>): EntryPoint[] {
 	return Object.entries(exports).map(([key, value]) => {
 		const { targets } = targetsOf(value, key);
 		const runtime =
-			targets.find(({ at }) => at === `${key} import`) ??
 			targets.find(({ at }) => at === `${key} default`) ??
+			targets.find(({ at }) => at === `${key} import`) ??
 			targets.find(({ at }) => at === key);
 		return {
 			key,

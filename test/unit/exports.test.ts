@@ -2,8 +2,11 @@
 // `package.json`'s `exports` (and `main` and `types`) is a file the build emits from a
 // source under `src/`, a subpath names its source (`"./pg"` is `src/pg/mod.ts`,
 // `"./migrate/files"` is `src/migrate/files.ts`), `types` comes before the other
-// conditions (TypeScript takes the first that matches), and every `src/**/mod.ts` and
-// `src/migrate/files.ts` is exported. The build's mapping of `src` to `dist`
+// conditions (TypeScript takes the first that matches), the file to load is under
+// `default` (the condition `import` and `require()` both match: under `import` alone,
+// `require()` finds no entry point), and every `src/**/mod.ts` and `src/migrate/files.ts`
+// is exported. Every entry point is then loaded both ways, since `require()` also refuses
+// a module that awaits at its top level, anywhere in the graph. The build's mapping of `src` to `dist`
 // (tsconfig.build.json) is checked too, since every target rests on it, and so is the
 // manifest's `files` list, which decides what is published.
 //
@@ -11,9 +14,11 @@
 // pass for a clean package.
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join, sep } from "node:path";
 import { describe, test } from "node:test";
-import { ROOT, readPackage, sourceOf, targetsOf } from "./_package.ts";
+import { pathToFileURL } from "node:url";
+import { entryPointsOf, ROOT, readPackage, sourceOf, targetsOf } from "./_package.ts";
 
 /** The sources that must be entry points: every `mod.ts`, and the SQL files loader. */
 function isEntrySource(path: string): boolean {
@@ -53,6 +58,9 @@ function exportProblems(
 			typeof value === "object" && value !== null ? Object.keys(value) : [];
 		if (conditions.includes("types") && conditions[0] !== "types") {
 			problems.push(`${key}: "types" is not the first condition`);
+		}
+		if (conditions.length > 0 && !conditions.includes("default")) {
+			problems.push(`${key}: no "default" condition, so require() cannot load it`);
 		}
 		const mapped = new Set<string>();
 		for (const { at, target } of found.targets) {
@@ -125,6 +133,29 @@ describe("unit/exports: package.json", () => {
 		assert.deepEqual(problems, [], `entry point problems:\n${problems.join("\n")}`);
 	});
 
+	test("every entry point loads with require() as well as with import, as one module", async () => {
+		const require = createRequire(import.meta.url);
+		const entries = entryPointsOf(readPackage());
+		assert.ok(entries.length >= 6, "fewer than six entry points");
+		for (const { key, source } of entries) {
+			assert.ok(source !== null, `${key} maps to no source`);
+			const path = join(ROOT, source);
+			const required = require(path) as Record<string, unknown>;
+			const imported = (await import(pathToFileURL(path).href)) as Record<
+				string,
+				unknown
+			>;
+			assert.deepEqual(
+				Object.keys(required).sort(),
+				Object.keys(imported).sort(),
+				key,
+			);
+			for (const name of Object.keys(imported)) {
+				assert.equal(required[name], imported[name], `${key}: ${name}`);
+			}
+		}
+	});
+
 	test("the build emits src/ to dist/, which the targets assume", () => {
 		const options = readJsonc("tsconfig.build.json").compilerOptions as Record<
 			string,
@@ -158,7 +189,7 @@ describe("unit/exports: the check, on fabricated manifests", () => {
 	];
 	const entry = (path: string) => ({
 		types: `./dist/${path}.d.ts`,
-		import: `./dist/${path}.js`,
+		default: `./dist/${path}.js`,
 	});
 	const clean = {
 		main: "./dist/mod.js",
@@ -183,10 +214,10 @@ describe("unit/exports: the check, on fabricated manifests", () => {
 				"./sql": entry("core/sql"),
 				"./migrate": {
 					types: "./dist/migrate/mod.d.ts",
-					import: "./dist/pg/mod.js",
+					default: "./dist/pg/mod.js",
 				},
 				"./migrate/files": {
-					import: "./dist/migrate/files.js",
+					default: "./dist/migrate/files.js",
 					types: "./dist/migrate/files.d.ts",
 				},
 				bad: entry("mod"),
@@ -196,7 +227,7 @@ describe("unit/exports: the check, on fabricated manifests", () => {
 		assert.deepEqual(exportProblems(pkg, sources), [
 			".: ./src/mod.ts is not a .js or .d.ts under ./dist/",
 			"./pg types: ./dist/pg/nothing.d.ts has no source (src/pg/nothing.ts)",
-			"./pg import: ./dist/pg/nothing.js has no source (src/pg/nothing.ts)",
+			"./pg default: ./dist/pg/nothing.js has no source (src/pg/nothing.ts)",
 			"./sql: built from src/core/sql.ts, which the subpath does not name",
 			"./migrate: its targets come from src/migrate/mod.ts and src/pg/mod.ts",
 			"./migrate: built from src/pg/mod.ts, which the subpath does not name",
@@ -217,6 +248,19 @@ describe("unit/exports: the check, on fabricated manifests", () => {
 			"src/pg/mod.ts: not exported",
 			"src/migrate/mod.ts: not exported",
 			"src/migrate/files.ts: not exported",
+		]);
+	});
+
+	test("an entry point under import alone, which require() cannot find", () => {
+		const pkg = {
+			...clean,
+			exports: {
+				...clean.exports,
+				"./pg": { types: "./dist/pg/mod.d.ts", import: "./dist/pg/mod.js" },
+			},
+		};
+		assert.deepEqual(exportProblems(pkg, sources), [
+			'./pg: no "default" condition, so require() cannot load it',
 		]);
 	});
 

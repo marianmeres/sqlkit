@@ -58,6 +58,8 @@ migrations. Not an ORM, not a query builder. An app commits to one dialect.
 7. Public-clean: no committed file names a private package
    (`test/unit/public-clean.test.ts` is the tripwire).
 8. Postgres is never skipped. A server a test starts takes an OS-assigned port.
+9. No top-level `await` in `src/`: `require()` cannot load a module that has one, and
+   every entry point loads both ways (`test/unit/exports.test.ts`).
 
 ## Before Making Changes
 
@@ -69,8 +71,8 @@ migrations. Not an ORM, not a query builder. An app commits to one dialect.
 - [ ] `pnpm run format`, then `pnpm run ci` green (needs the test Postgres).
 - [ ] Update the docs the change invalidates: this file, `docs/`, `README.md`, `API.md`.
       A new export goes in `API.md` under its entry point
-      (`test/unit/api-docs.test.ts`); a new entry point in `package.json`'s `exports`
-      (`test/unit/exports.test.ts`).
+      (`test/unit/api-docs.test.ts`); a new entry point in `package.json`'s `exports`,
+      under `types` and `default` (`test/unit/exports.test.ts`).
 
 Source comments cite decisions as `Dnn` and plan sections as "plan doc NN #n": both are in
 the v0 plan set, archived under `docs/_archive/plans/v0-foundation/`. What is still open
