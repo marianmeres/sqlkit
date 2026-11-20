@@ -1,6 +1,6 @@
 {
   "name": "@marianmeres/sqlkit",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A thin, convention-driven SQL toolkit for PostgreSQL and SQLite: safe composable sql fragments, one driver contract with a sync tier, typed errors, transactions, retry and migrations. Not an ORM, not a query builder.",
   "license": "MIT",
   "author": "Marian Meres",
