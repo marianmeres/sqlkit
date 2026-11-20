@@ -29,6 +29,7 @@ import {
 	SerializationError,
 	SqlError,
 	TransactionAbortedError,
+	withRetry,
 } from "../../src/mod.ts";
 import { createPgDriver } from "../../src/pg/mod.ts";
 import { testPgConfig } from "../_env.ts";
@@ -331,6 +332,11 @@ describe("pg/errors: connecting", () => {
 			new pg.Pool({ ...testPgConfig(), max: 1, connectionTimeoutMillis: 100 }),
 		);
 		try {
+			// The pool's one connection is made first, and again when the server took longer
+			// than the timeout to accept it: the timeout covers connecting too, and a holder
+			// that could not connect would never open its gate. What is timed below is the
+			// wait for the connection, and nothing else.
+			await withRetry(() => driver.query("select 1"));
 			const holds = gate();
 			const done = gate();
 			const holder = settle(
