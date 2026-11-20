@@ -150,6 +150,10 @@ if (error.code === "23505" || /UNIQUE constraint failed/.test(error.message)) â€
 - Postgres is read from `TEST_PG_*` (`test/_env.ts`). Missing, it fails the suite; nothing
   is skipped to get to green.
 - A server a test starts takes an OS-assigned port.
+- No test waits forever: every test script passes `--test-timeout=60000`, so a case whose
+  promise never settles (a gate nobody opened) fails after a minute. Without it the
+  runner keeps waiting, and the gate with it. A case still opens its gates on every path:
+  the timeout is the net, not the plan.
 - A guard is tested on fabricated sources too, so a scan that finds nothing cannot pass.
 - Assertions use `node:assert/strict`.
 
