@@ -103,6 +103,9 @@ if (error.code === "23505" || /UNIQUE constraint failed/.test(error.message)) â€
   message is what reaches a log.
 - A field the database does not report (`constraint`, `table`, `columns`) is left
   undefined, not guessed.
+- Recognize a `SqlError` with `instanceof`, never by its constructor or its prototype: an
+  app may run two copies of the package, and `instanceof` is what reads the mark that
+  makes one copy's error an instance of the other's classes.
 
 ## Patterns
 

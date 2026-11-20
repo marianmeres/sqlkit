@@ -11,6 +11,15 @@
  * callback code is never wrapped, and a programming mistake is a `TypeError`, never a
  * `SqlError`.
  *
+ * **Two copies of this module in one process know each other's errors.** An app whose
+ * dependencies ask for two `0.x` minors of the package runs two copies of it, so two sets
+ * of these classes, and an error one copy's driver threw is no instance of the other's by
+ * its prototype chain. So every `SqlError` is marked, on its prototype, with a symbol from
+ * `Symbol.for`, as a fragment is (`sql.ts`), and `instanceof` reads the mark: an error
+ * another copy built is a `SqlError` here, and an instance of the subclass of its `kind`.
+ * A copy from before the mark (0.2.0 and older) has none, and its errors are recognized by
+ * nobody but itself.
+ *
  * Runtime-neutral: imports only the core's types.
  */
 
@@ -74,10 +83,36 @@ const KINDS: ReadonlySet<string> = new Set<SqlErrorKind>([
 ]);
 
 /**
+ * What marks an error as a `SqlError`, whichever copy of this module built it. JSON cannot
+ * carry a symbol, so a parsed object that merely has the fields of one is not one.
+ */
+const BRAND = Symbol.for("@marianmeres/sqlkit/error");
+
+/** What `instanceof` does for a class that says nothing else: the prototype chain. */
+const inChain = Function.prototype[Symbol.hasInstance];
+
+/** Whether `value` carries the mark: a `SqlError` of this copy or of another. */
+function isMarked(value: unknown): value is { readonly kind?: unknown } {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as Record<symbol, unknown>)[BRAND] === true
+	);
+}
+
+/**
  * A statement or a connection the database refused. Thrown by every adapter in place of
  * its driver's error, which is kept as `cause`. Catch a subclass, or read `kind`.
+ *
+ * `instanceof` holds across copies of the package: see the module comment.
  */
 export class SqlError extends Error {
+	/** `value instanceof Class`, for `SqlError` and every class that extends it. */
+	static override [Symbol.hasInstance](value: unknown): boolean {
+		// biome-ignore lint/complexity/noThisInStatic: the class `instanceof` named, which may be a subclass
+		return isInstance(this, value);
+	}
+
 	readonly kind: SqlErrorKind;
 	readonly dialect: DialectName;
 	/** See {@link SqlErrorInfo.code}. */
@@ -160,6 +195,25 @@ const CLASS_OF: ReadonlyMap<SqlErrorKind, typeof SqlError> = new Map<
 	["unknown", SqlError],
 ]);
 
+/**
+ * `value instanceof Class`, for `SqlError` and every class that extends it.
+ *
+ * An error this copy built is what its prototype chain says, and nothing more. One another
+ * copy built is a `SqlError` by its mark, and an instance of the class `toSqlError` builds
+ * for its `kind`. It is no instance of a class declared outside this module, and one of a
+ * kind this copy does not know is a `SqlError` and nothing narrower.
+ */
+function isInstance(Class: unknown, value: unknown): boolean {
+	if (inChain.call(Class, value)) return true;
+	if (inChain.call(SqlError, value) || !isMarked(value)) return false;
+	if (Class === SqlError) return true;
+	return Class !== undefined && Class === CLASS_OF.get(value.kind as SqlErrorKind);
+}
+
+// The mark lives on the one prototype every `SqlError` inherits from: not enumerable, so
+// it stays out of `Object.keys` and of an equality check, and not writable.
+Object.defineProperty(SqlError.prototype, BRAND, { value: true });
+
 // `name` lives on each prototype, not on each instance: it is set before the constructor
 // runs (so the stack's first line says it), stays out of `Object.keys`, and survives a
 // minifier that renames the classes.
@@ -187,7 +241,8 @@ for (const [Class, name] of [
 /**
  * A driver's error as a `SqlError`: classified by `classify`, built as the subclass of its
  * kind, with the driver's message and the driver's error as `cause`, untouched.
- * Idempotent: a `SqlError` passes through as it is.
+ * Idempotent: a `SqlError` passes through as it is, one another copy of the package built
+ * included.
  */
 export function toSqlError(
 	error: unknown,

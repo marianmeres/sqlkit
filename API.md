@@ -405,6 +405,16 @@ does not know is a `TypeError`.
 Catch a subclass, or read `kind`. Each subclass is built by [`toSqlError`](#tosqlerrorerror-dialect-classify)
 for its kind; `SqlError` itself is `unknown`, everything no classifier recognized.
 
+`instanceof` holds across copies of the package. An app whose dependencies ask for two
+`0.x` minors runs two copies, each with classes of its own, so every `SqlError` carries a
+mark (a `Symbol.for` key, on its prototype) that `instanceof` reads: an error another
+copy built is a `SqlError` here, and an instance of the subclass of its `kind`. That is
+what lets `withRetry` retry, and a `catch` branch take, an error thrown by a driver that
+another package built. An error this copy built is what its prototype chain says: one
+built by hand as the base class is not the subclass of its kind, and a class you declare
+yourself has only its own instances. A copy of 0.2.0 or older has no mark: its errors
+are recognized by itself alone.
+
 | Class                      | `kind`          | What happened                                                                     | Retryable |
 | -------------------------- | --------------- | --------------------------------------------------------------------------------- | --------- |
 | `UniqueViolationError`     | `unique`        | a duplicate of a unique index or a primary key                                    |           |

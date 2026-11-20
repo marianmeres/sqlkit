@@ -257,6 +257,9 @@ try {
   connection.
 - A programming mistake (a wrong argument, a refused call) is a `TypeError`, never a
   `SqlError`. What your own callback threw comes out as you threw it.
+- `instanceof` holds across two copies of the package in one app, so an error thrown by
+  a driver another package built is still caught by its class, and still retried by
+  `withRetry`. Both copies have to be newer than 0.2.0.
 
 ## Statement builders
 

@@ -238,6 +238,11 @@ A non-write's `rowCount` (DDL, a `SET`, a pragma) is a number and nothing more.
   `checkHealth` classifies by dialect alone.
 - `SqlError.retryable` is true for `serialization`, `deadlock`, `busy` and `connection`;
   `withRetry` retries on it.
+- Two copies of the package in one process (two `0.x` minors, each some dependency's) are
+  two sets of classes. Every `SqlError` is marked on its prototype with a `Symbol.for`
+  key, and `Symbol.hasInstance` reads it: another copy's error is a `SqlError` here and
+  an instance of the subclass of its `kind`. This copy's own errors are what their
+  prototype chain says. A copy of 0.2.0 or older carries no mark.
 
 ## Migrations
 
